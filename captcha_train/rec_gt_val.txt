@@ -1,0 +1,15 @@
+images/captcha_1780199128649.png	5-3
+images/captcha_1780202140031.png	9+4
+images/captcha_1780189396480.png	8+5
+images/captcha_1780194225082.png	4+2
+images/captcha_1780201229618.png	2*1
+images/captcha_1780209540305.png	7-2
+images/captcha_1780194130078.png	1+3
+images/captcha_1780186317697.png	2*3
+images/captcha_1780185785813.png	9-8
+images/captcha_1780185883286.png	1*3
+images/captcha_1780208904318.png	5+7
+images/captcha_1780195615532.png	9-6
+images/captcha_1780202491721.png	3*5
+images/captcha_1780215741170.png	8-5
+images/captcha_1780194718192.png	4*1

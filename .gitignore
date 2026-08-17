@@ -1,0 +1,29 @@
+# ── Build ──────────────────────────────────────────────────────────────
+build/
+.gradle/
+local.properties
+*.apk
+
+# ── IDE ────────────────────────────────────────────────────────────────
+.idea/
+*.iml
+
+# ── Claude Code (setting lokal per-mesin; CLAUDE.md tetap di-track) ────
+.claude/settings.local.json
+
+# ── captcha_train: artefak besar, semuanya bisa dibuat ulang ───────────
+# Clone PaddleOCR (~617MB, punya .git sendiri):
+#   git clone https://github.com/PaddlePaddle/PaddleOCR captcha_train/PaddleOCR
+captcha_train/PaddleOCR/
+
+# Checkpoint training (~906MB) dan pretrained en_PP-OCRv4_rec (~364MB)
+captcha_train/output/
+captcha_train/pretrain/
+
+# Artefak export Paddle. Model final yang dipakai app ada di
+# app/src/main/assets/ocr_captcha/ dan ITU yang di-track.
+captcha_train/inference/
+captcha_train/captcha_rec.onnx
+
+# Log training/inference (regenerable)
+captcha_train/*.log
