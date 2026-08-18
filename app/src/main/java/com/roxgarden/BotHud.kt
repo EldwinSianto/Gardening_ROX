@@ -28,7 +28,10 @@ class BotHud(
         const val MASK_X = 0.34f   // 0 .. MASK_X
         const val MASK_Y = 0.86f   // MASK_Y .. 1.0
         private const val TAP_MARK_MS = 600L
-        private const val MAX_LINES = 3
+        // 3 → 2: baris ketiga panel dipakai permanen untuk angka timing (PerfStats.hudLine).
+        // Geometri panel & MASK_X/MASK_Y sengaja TIDAK diubah — memperbesar panel berarti
+        // memperbesar area yang dihitamkan dari capture, bisa menelan teks yang perlu OCR.
+        private const val MAX_LINES = 2
     }
 
     private data class TapMark(val xFrac: Float, val yFrac: Float, val expireAt: Long)
@@ -39,6 +42,7 @@ class BotHud(
 
     private val lines = ArrayDeque<String>()   // baris terbaru di depan
     private val marks = mutableListOf<TapMark>()
+    @Volatile private var statsLine = ""       // baris timing permanen (paling bawah panel)
 
     fun show() {
         if (isShowing) return
@@ -84,6 +88,17 @@ class BotHud(
         }
     }
 
+    /**
+     * Baris timing permanen di dasar panel (dari PerfStats.hudLine). Terpisah dari status()
+     * supaya tidak ikut tergeser keluar oleh langkah bot yang berganti cepat — di device tanpa
+     * adb ini satu-satunya cara membaca biaya tiap langkah saat bot jalan.
+     */
+    fun stats(text: String) {
+        if (statsLine == text) return
+        statsLine = text
+        view?.post { view?.invalidate() }
+    }
+
     /** Penanda lingkaran sesaat di titik tap (fraksi layar). */
     fun flashTap(xFrac: Float, yFrac: Float) {
         val v = view ?: return
@@ -103,6 +118,8 @@ class BotHud(
             typeface = Typeface.MONOSPACE
         }
         private val dimPaint = Paint(txtPaint).apply { color = Color.argb(150, 255, 255, 255); textSize = 18f }
+        // Baris timing: warna beda supaya tidak tertukar dengan langkah bot saat dibaca sekilas
+        private val statsPaint = Paint(txtPaint).apply { color = Color.argb(220, 120, 230, 255); textSize = 17f }
         private val markPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(230, 255, 60, 60); style = Paint.Style.STROKE; strokeWidth = 5f
         }
@@ -114,11 +131,14 @@ class BotHud(
             val top = h * MASK_Y
             canvas.drawRoundRect(6f, top + 4f, w * MASK_X - 6f, h - 6f, 10f, 10f, bgPaint)
             val snapshot = synchronized(lines) { lines.toList() }
-            var y = top + 32f
+            var y = top + 30f
             snapshot.forEachIndexed { i, line ->
                 canvas.drawText(line, 18f, y, if (i == 0) txtPaint else dimPaint)
-                y += if (i == 0) 26f else 22f
+                y += if (i == 0) 24f else 22f
             }
+            // Timing di-anchor ke DASAR panel, bukan setelah baris status — posisinya tetap
+            // walau jumlah baris status berubah, jadi angkanya gampang dibaca sekilas.
+            if (statsLine.isNotEmpty()) canvas.drawText(statsLine, 18f, h - 12f, statsPaint)
 
             // Penanda tap (di luar panel, tidak di-mask — berumur pendek)
             val now = System.currentTimeMillis()

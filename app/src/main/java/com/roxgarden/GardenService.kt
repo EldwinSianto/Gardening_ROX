@@ -138,22 +138,154 @@ class GardenService : AccessibilityService() {
         }
     }
 
+    // ── SHELL ROOT PERSISTEN ───────────────────────────────────────────────
+    // rootExec() mem-fork proses `su` BARU tiap capture (fork + exec + transisi SELinux). Di loop
+    // panen capture terjadi 5-6× per siklus, jadi ongkos itu dibayar terus-menerus. Shell ini
+    // dibuka sekali, perintah dikirim lewat stdin.
+    //
+    // Output screencap sengaja TIDAK dialirkan lewat stdout shell: satu byte meleset akan men-
+    // desync stream SELAMANYA, dan device target tanpa adb mustahil didiagnosa kalau itu terjadi.
+    // Gantinya screencap menulis ke /dev (tmpfs = RAM, bukan disk) dan shell hanya membalas satu
+    // baris "OK" — tiap capture berdiri sendiri, desync mustahil.
+    private val CAP_TMP = "/dev/roxgarden_cap.raw"
+    private var rootShell: Process? = null
+    private var rootShellOut: java.io.Writer? = null
+    private var rootShellIn: java.io.BufferedReader? = null
+
+    private fun closeRootShell() {
+        try { rootShellOut?.close() } catch (_: Throwable) {}
+        try { rootShellIn?.close() } catch (_: Throwable) {}
+        try { rootShell?.destroy() } catch (_: Throwable) {}
+        rootShellOut = null; rootShellIn = null; rootShell = null
+    }
+
+    private fun rootShellReady(): Boolean {
+        rootShell?.let { p ->
+            // exitValue() melempar selama proses masih hidup — itulah cara cek "masih jalan".
+            val alive = try { p.exitValue(); false } catch (_: IllegalThreadStateException) { true }
+            if (alive) return true
+            Log.w(TAG, "shell root mati → buka ulang")
+            closeRootShell()
+        }
+        return try {
+            val np = Runtime.getRuntime().exec(arrayOf("su"))
+            rootShell = np
+            rootShellOut = java.io.OutputStreamWriter(np.outputStream)
+            rootShellIn = java.io.BufferedReader(java.io.InputStreamReader(np.inputStream))
+            Log.d(TAG, "shell root persisten dibuka")
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "shell root gagal dibuka: ${t.message}")
+            closeRootShell(); false
+        }
+    }
+
+    // Buffer raw dipakai ulang: framebuffer 1080p = 8.3MB, dan readBytes() lama menumbuhkan
+    // buffer dengan doubling (~4 realokasi + copy 8MB tiap frame). Panjang efektif dikembalikan
+    // terpisah karena buffer boleh lebih besar dari isi file.
+    private var rawBuf: ByteArray? = null
+
+    private fun rootShellCapture(physId: Long): Pair<ByteArray, Int>? {
+        if (!rootShellReady()) return null
+        val out = rootShellOut ?: return null
+        val inp = rootShellIn ?: return null
+        return try {
+            // chmod tiap kali: `>` mempertahankan mode file yang sudah ada, tapi file bisa saja
+            // baru dibuat (reboot / /dev bersih) — sekali lewat, app selamanya tak bisa membacanya.
+            out.write("screencap -d $physId > $CAP_TMP 2>/dev/null; chmod 666 $CAP_TMP; echo OK\n")
+            out.flush()
+            if (inp.readLine()?.trim() != "OK") { closeRootShell(); return null }
+            val f = java.io.File(CAP_TMP)
+            val len = f.length().toInt()
+            if (len < 16) return null
+            val buf = rawBuf?.takeIf { it.size >= len } ?: ByteArray(len).also { rawBuf = it }
+            java.io.FileInputStream(f).use { ins ->
+                var off = 0
+                while (off < len) {
+                    val n = ins.read(buf, off, len - off)
+                    if (n <= 0) break
+                    off += n
+                }
+                if (off < len) return null
+            }
+            buf to len
+        } catch (t: Throwable) {
+            Log.w(TAG, "capture via shell persisten gagal: ${t.message}")
+            closeRootShell(); null
+        }
+    }
+
+    // Bitmap full-res dipakai ulang antar capture — alokasi 8.3MB per frame bikin GC churn berat.
+    // TIDAK dipakai ulang kalau tingginya sudah kanonik: di kasus itu toCanonical mengembalikan
+    // bitmap INI apa adanya, pemanggil me-recycle-nya, dan capture berikutnya akan memakai bitmap
+    // mati. Device 720p asli toh tidak menjalankan pass skala, jadi tidak ada yang hilang.
+    private var fullResCache: Bitmap? = null
+    private fun fullResBitmap(w: Int, h: Int): Bitmap {
+        if (h == CANON_H) return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val c = fullResCache
+        if (c != null && !c.isRecycled && c.width == w && c.height == h) return c
+        if (c != null && !c.isRecycled) c.recycle()
+        return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { fullResCache = it }
+    }
+
+    /** Recycle yang aman untuk hasil rootScreencap — bitmap cache tidak boleh ikut mati. */
+    private fun releaseFullRes(b: Bitmap) {
+        if (b !== fullResCache && !b.isRecycled) b.recycle()
+    }
+
+    /** Variance luminance dari framebuffer MENTAH (RGBA_8888) — sampling tiap 32 piksel. */
+    private fun rawVariance(raw: ByteArray, offset: Int, w: Int, h: Int): Double {
+        val step = 32
+        var sum = 0.0; var sumSq = 0.0; var n = 0
+        var y = 0
+        while (y < h) {
+            val rowBase = offset + y * w * 4
+            var x = 0
+            while (x < w) {
+                val i = rowBase + x * 4
+                val lum = ((raw[i].toInt() and 0xff) +
+                           (raw[i + 1].toInt() and 0xff) +
+                           (raw[i + 2].toInt() and 0xff)) / 3.0
+                sum += lum; sumSq += lum * lum; n++
+                x += step
+            }
+            y += step
+        }
+        if (n == 0) return 0.0
+        val mean = sum / n
+        return sumSq / n - mean * mean
+    }
+
+    // Variance frame terakhir, dihitung dari byte mentah saat capture — menggantikan ~2000
+    // panggilan JNI getPixel() pada bitmap jadi. Dibaca oleh captureScreen untuk deteksi blank.
+    @Volatile private var lastRawVariance = 0.0
+
     // screencap raw: header 12/16 byte (w,h,format[,colorspace] LE) + piksel RGBA_8888
     private fun rootScreencap(physId: Long): Bitmap? {
-        val raw = rootExec("screencap -d $physId") ?: return null
-        if (raw.size < 16) return null
+        // Jalur cepat: shell persisten + tmpfs. Gagal → fallback ke fork per-capture (jalur lama).
+        val fast = rootShellCapture(physId)
+        val raw: ByteArray
+        val len: Int
+        if (fast != null) {
+            raw = fast.first; len = fast.second
+        } else {
+            val legacy = rootExec("screencap -d $physId") ?: return null
+            raw = legacy; len = legacy.size
+        }
+        if (len < 16) return null
         fun i32(off: Int) = (raw[off].toInt() and 0xff) or ((raw[off + 1].toInt() and 0xff) shl 8) or
             ((raw[off + 2].toInt() and 0xff) shl 16) or ((raw[off + 3].toInt() and 0xff) shl 24)
         val w = i32(0); val h = i32(4)
         if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return null
         val need = w * h * 4
         val offset = when {
-            raw.size - 16 >= need -> 16
-            raw.size - 12 >= need -> 12
+            len - 16 >= need -> 16
+            len - 12 >= need -> 12
             else -> return null
         }
+        lastRawVariance = rawVariance(raw, offset, w, h)
         return try {
-            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val bmp = fullResBitmap(w, h)
             bmp.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(raw, offset, need))
             bmp
         } catch (t: Throwable) { null }
@@ -382,6 +514,24 @@ class GardenService : AccessibilityService() {
     private val DELAY_INSUFFICIENT    = 60_000L
     private val DELAY_PLANT_NOT_READY = 300_000L
     private val DELAY_CAPTCHA_TIMEOUT = 35_000L
+
+    /**
+     * Jeda pickup DIKURANGI biaya capture. Urutan sesudah jeda ini selalu: bangun → capture →
+     * cek orb → tap. Tanpa kompensasi, tap mendarat di DELAY_AFTER_GATHER + durasi capture,
+     * jadi jeda 5 detik yang diminta user sebenarnya berjalan ~5.6 detik di device.
+     *
+     * Hanya jalur ini yang dikompensasi. `delay(700)` di scheduleAfterTap TIDAK: di situ frame
+     * diambil pada awal eksekusi screencap, jadi frame-nya memang mendarat di ~700ms — menguranginya
+     * justru membuat pengecekan terlalu dini. Sisa tidur maturity sudah punya kompensasi sendiri.
+     *
+     * Lantai 60%: EMA yang melonjak (host emulator ngadat) tidak boleh mengkerutkan jeda sampai
+     * pickup belum selesai.
+     */
+    private fun pickupDelay(): Long {
+        val cap = perf.ema(PerfStats.CAP)
+        if (cap <= 0L) return DELAY_AFTER_GATHER
+        return (DELAY_AFTER_GATHER - cap).coerceAtLeast((DELAY_AFTER_GATHER * 0.6).toLong())
+    }
     private val NUMPAD_TEMPLATE_THRESHOLD = 2500.0 // avgSAD max untuk template match valid
 
     // Debug overlay
@@ -453,8 +603,12 @@ class GardenService : AccessibilityService() {
             return b
         }
         val w = Math.round(b.width * CANON_H.toFloat() / b.height)
+        // Bilinear (filter=true) WAJIB dipertahankan: template orb adalah aset yang dicrop di
+        // 1280×720 dan dicocokkan SSD dengan ambang keras. Downscale nearest-neighbour
+        // menghasilkan piksel berbeda → SSD naik → orb gagal match diam-diam.
         val scaled = Bitmap.createScaledBitmap(b, w, CANON_H, true)
-        if (scaled !== b) b.recycle()
+        // b bisa jadi bitmap cache full-res yang dipakai ulang capture berikutnya — jangan recycle.
+        if (scaled !== b && b !== fullResCache) b.recycle()
         screenWidth = scaled.width; screenHeight = scaled.height
         return scaled
     }
@@ -720,6 +874,12 @@ class GardenService : AccessibilityService() {
         try { unregisterReceiver(navTestReceiver) } catch (_: Throwable) {}      // CITY NAV (removable)
         try { unregisterReceiver(panelTestReceiver) } catch (_: Throwable) {}    // CITY NAV (removable)
         try { unregisterReceiver(stuckTestReceiver) } catch (_: Throwable) {}    // CITY NAV (removable)
+        // Shell root persisten hidup selama service — tanpa ini prosesnya menggantung setelah
+        // service mati (dan `su` yatim tetap memegang fd).
+        closeRootShell()
+        fullResCache?.let { if (!it.isRecycled) it.recycle() }
+        fullResCache = null
+        rawBuf = null
         super.onDestroy()
     }
 
@@ -804,6 +964,10 @@ class GardenService : AccessibilityService() {
 
     @Volatile private var lastCaptureSource = "-"
 
+    // Instrumentasi timing — sebelum ini tidak ada satu pun pengukuran di kode, jadi semua
+    // konstanta delay adalah tebakan. Dibaca lewat HUD (baris bawah) & dialog DIAGNOSA.
+    val perf = PerfStats()
+
     /**
      * DIAGNOSA untuk device tanpa adb (cloud phone) — jalankan semua pengecekan yang biasanya
      * kubaca dari logcat, kembalikan sebagai teks untuk ditampilkan di layar.
@@ -846,11 +1010,44 @@ class GardenService : AccessibilityService() {
                 bmp.recycle()
             }
             sb.appendLine("Mode: ${currentMode()}, dalam window gardening: ${if (shouldGardenNow()) "YA" else "TIDAK"}")
+            // Timing per langkah — di device tanpa adb ini pengganti logcat untuk menilai
+            // di mana waktu siklus sebenarnya habis.
+            sb.appendLine("Shell root persisten: ${if (rootShell != null) "AKTIF" else "tidak (pakai fork per-capture)"}")
+            sb.appendLine("Timing per langkah:")
+            sb.appendLine(perf.report())
+            sb.appendLine("  jeda pickup efektif=${pickupDelay()}ms (konstanta ${DELAY_AFTER_GATHER}ms)")
             cb(sb.toString())
         }
     }
 
+    /**
+     * Pembungkus berinstrumen — SEMUA pemanggil lewat sini, jadi biaya capture (jalur mana pun
+     * yang menang) selalu tercatat. Capture gagal tidak dicatat: durasinya bukan biaya normal
+     * dan akan merusak EMA yang dipakai kompensasi latensi.
+     */
     private fun captureScreen(): Bitmap? {
+        val t0 = System.currentTimeMillis()
+        val b = captureScreenRaw()
+        if (b != null) {
+            perf.record(PerfStats.CAP, System.currentTimeMillis() - t0)
+            botHud?.stats(perf.hudLine())
+        }
+        return b
+    }
+
+    /**
+     * Capture DISERIALKAN. Jalur root sekarang berbagi tiga state: buffer raw, bitmap full-res
+     * cache, dan shell persisten. Sebelumnya tiap capture mengalokasikan sendiri, jadi dua capture
+     * bersamaan cuma boros memori; dengan reuse, dua capture bersamaan bisa saling menimpa piksel
+     * di tengah pass skala atau men-desync handshake shell. Loop utama, scheduleAfterTap, sentinel
+     * maturity, dan handleCaptcha memang sudah saling mengunci lewat flag — lock ini penjaga
+     * terakhir, dan di jalur normal tidak menambah latensi karena tidak pernah ada kontensi.
+     */
+    private val captureLock = Any()
+
+    private fun captureScreenRaw(): Bitmap? = synchronized(captureLock) { captureScreenLocked() }
+
+    private fun captureScreenLocked(): Bitmap? {
         // 0. PRIMER: root screencap physical display game (satu-satunya yang andal di MuMu multi-tab).
         //    BLOCKING — semua pemanggil sudah di background thread. Dilewati kalau tidak ada root.
         if (hasRoot()) {
@@ -861,9 +1058,9 @@ class GardenService : AccessibilityService() {
             }
             if (gd != null) {
                 var b = rootScreencap(gd.physId)
-                if (b != null && frameVariance(b) < 1.0) {
+                if (b != null && lastRawVariance < 1.0) {
                     // frame blank — display game pindah (MuMu recreate saat ganti tab) → probe ulang
-                    b.recycle(); b = null
+                    releaseFullRes(b); b = null
                     val fresh = probeGameDisplayRoot()
                     if (fresh != null) {
                         rootDisplay = fresh; gameDisplayId = fresh.logicalId
@@ -986,7 +1183,7 @@ class GardenService : AccessibilityService() {
                             Log.d(TAG, "FAST-PATH: orb siap → tap tanpa OCR (streak=$fastPathStreak)")
                             hud("⚡ tap Gardening (cepat)")
                             markGardenActivity()
-                            lastGardenTapMs = System.currentTimeMillis()
+                            markGardenTap()
                             performTap(pos.first + (-8..8).random(), pos.second + (-8..8).random())
                             scheduleAfterTap(loop)
                             return@launch
@@ -994,7 +1191,7 @@ class GardenService : AccessibilityService() {
                     }
                 }
                 val state = try {
-                    analyzeScreen(img)
+                    perf.time(PerfStats.OCR) { analyzeScreen(img) }
                 } catch (t: Throwable) {
                     Log.e(TAG, "analyzeScreen error: ${t.javaClass.simpleName}: ${t.message}")
                     GameStatus(StatusType.NORMAL)
@@ -1128,9 +1325,10 @@ class GardenService : AccessibilityService() {
                         }
                         StatusType.GATHERING -> {
                             Log.d(TAG, "Gathering, tunggu ${DELAY_AFTER_GATHER}ms")
-                            hud("🌾 gathering → ambil ${DELAY_AFTER_GATHER / 1000.0}s")
+                            val pickup = pickupDelay()
+                            hud("🌾 gathering → ambil ${pickup / 1000.0}s")
                             expectReadyNext = true   // habis pickup, tombol biasanya langsung siap → fast-path
-                            handler.postDelayed(loop, DELAY_AFTER_GATHER)
+                            handler.postDelayed(loop, pickup)
                         }
                         StatusType.GARDENING_READY -> {
                             if (!shouldGardenNow()) {
@@ -1436,7 +1634,10 @@ class GardenService : AccessibilityService() {
      * muncul. Teks toast seukuran teks tombol (tak perlu upscale). Dipakai scheduleAfterTap
      * untuk membedakan "tombol hilang karena gather" vs "tombol TERTUTUP toast" (temuan user).
      */
-    private fun readCenterBand(bitmap: Bitmap): String {
+    private fun readCenterBand(bitmap: Bitmap): String =
+        perf.time(PerfStats.BAND) { readCenterBandImpl(bitmap) }
+
+    private fun readCenterBandImpl(bitmap: Bitmap): String {
         val processor = ocrProcessor ?: return ""
         val x1 = (bitmap.width * 0.20f).toInt(); val y1 = (bitmap.height * 0.32f).toInt()
         val w = (bitmap.width * 0.60f).toInt();  val h = (bitmap.height * 0.26f).toInt()
@@ -1449,6 +1650,15 @@ class GardenService : AccessibilityService() {
         } catch (_: Throwable) { "" }
         finally { crop?.let { if (!it.isRecycled) it.recycle() } }
     }
+
+    /**
+     * Banner hadiah panen ("Obtained <item> × 1"). TEMUAN USER: banner ini menyapu naik dari
+     * bawah layar dan sempat menutupi tombol Gardening tepat saat panen selesai — lihat
+     * pemakaiannya di scheduleAfterTap. Kebalikan dari isNoGardenToast: yang ini bukti panen
+     * BERHASIL, bukan tap yang gagal.
+     */
+    private fun isObtainedToast(lower: String): Boolean =
+        "obtained" in lower || "diperoleh" in lower || "didapat" in lower
 
     /** Teks toast yang berarti tap TIDAK memicu gather (belum matang / stamina / period). */
     private fun isNoGardenToast(lower: String): Boolean =
@@ -1595,6 +1805,22 @@ class GardenService : AccessibilityService() {
     // sesaat setelah tap (animasi jalan/gather baru mulai, teks belum stabil).
     @Volatile private var lastGardenTapMs = 0L
 
+    /**
+     * Catat tap panen + ukur panjang siklus (tap → tap berikutnya). Semua jalur tap Gardening
+     * lewat sini supaya "cycle" di HUD benar-benar mewakili ritme panen.
+     */
+    private fun markGardenTap() {
+        val now = System.currentTimeMillis()
+        val prev = lastGardenTapMs
+        // >90 detik = bukan siklus panen beruntun (maturity panjang, navigasi kota, captcha di
+        // tengah) — jangan cemari EMA yang justru dipakai membaca ritme panen normal.
+        if (prev > 0) {
+            val d = now - prev
+            if (d in 1_000L..90_000L) perf.record(PerfStats.CYCLE, d)
+        }
+        lastGardenTapMs = now
+    }
+
     // FAST-PATH: siklus TEPAT setelah tidur maturity / jeda pickup selesai — tombol hampir pasti
     // siap, tak perlu bayar OCR (~1-2s) untuk memastikannya. Template orb (~30ms) cukup.
     @Volatile private var expectReadyNext = false
@@ -1622,7 +1848,7 @@ class GardenService : AccessibilityService() {
         val (cx, cy) = gardeningCenter(screenW, screenH)
         val x = cx + (-8..8).random()
         val y = cy + (-8..8).random()
-        lastGardenTapMs = System.currentTimeMillis()
+        markGardenTap()
         performTap(x, y)
         Log.d(TAG, "Tap Gardening ($x, $y)")
     }
@@ -1774,8 +2000,19 @@ class GardenService : AccessibilityService() {
      * ke jalur OCR yang bisa mengklasifikasi. Tap tak berefek (tombol tetap ada) → hitung
      * noopTapStreak (usulan user: itu SINYAL maturity) + OCR segera; streak ≥2 → tahan tap.
      */
+    // Kadens poll adaptif (lihat loop pelacakan di bawah).
+    private val POLL_COARSE_MS = 800L      // durasi cast belum dipelajari: kadens lama
+    private val POLL_NEAR_MS = 300L        // dekat batas cast: rapat, supaya batasnya tajam
+    private val POLL_BLIND_MAX_MS = 2000L  // jauh dari batas: tidur, tapi jendela buta ≤2 detik
+    // Sebelum ambang ini, banner "Obtained" yang terbaca kemungkinan dari sumber lain (drop,
+    // quest) dan TIDAK boleh memotong cast yang masih berjalan. Dipakai saat durasi cast belum
+    // dipelajari; sesudahnya castFloor yang jadi ambang.
+    private val OBTAINED_MIN_ELAPSED_MS = 1500L
+
     private fun scheduleAfterTap(loop: Runnable) {
         scope.launch {
+            // Patokan durasi cast diukur dari SINI — dipanggil tepat setelah performTap.
+            val tapAt = System.currentTimeMillis()
             kotlinx.coroutines.delay(700)
             if (isHandlingCaptcha || gardenPaused || !isRunning) return@launch
             val shot = captureScreen()
@@ -1835,8 +2072,31 @@ class GardenService : AccessibilityService() {
             val start = System.currentTimeMillis()
             var reappeared = false
             var poll = 0
+            // POLL ADAPTIF: durasi cast konstan per tanaman, jadi sebagian besar penantian ini
+            // sebenarnya sudah bisa diprediksi. Lantai dari sampel TERKECIL (bukan EMA — lihat
+            // PerfStats.min: EMA berisi overshoot deteksi dan akan merangkak naik tiap siklus).
+            // Butuh ≥3 sampel supaya tanaman/kota yang baru berganti tidak dijadwal dari data basi.
+            val castFloor = if (perf.samples(PerfStats.CAST) >= 3) perf.min(PerfStats.CAST) else 0L
+            // Ambang mulai curiga oklusi banner. Lantai 1000ms: deteksi lewat banner memberi batas
+            // lebih awal → castFloor (min) ikut turun tiap siklus, dan tanpa lantai ambang ini bisa
+            // merosot sampai memotong cast yang masih jalan.
+            val obtainedAfterMs =
+                if (castFloor > 0) maxOf(castFloor - 500, 1000L) else OBTAINED_MIN_ELAPSED_MS
+            var occludedByBanner = false
             while (System.currentTimeMillis() - start < 15_000) {
-                kotlinx.coroutines.delay(800)
+                // Jauh dari batas → tidur lebih panjang, TAPI dibatasi POLL_BLIND_MAX_MS: tiap
+                // bangun tetap menjalankan template captcha (~30ms), jadi jendela butanya pendek.
+                // Dekat batas (atau durasi cast belum dipelajari) → poll rapat supaya titik
+                // "tombol muncul lagi" tajam; jeda pickup dihitung dari titik itu.
+                // Durasi cast belum dipelajari → kadens lama 800ms apa adanya. Poll rapat tanpa
+                // tahu batasnya cuma menambah capture (300ms + biaya capture, 15 detik penuh)
+                // tanpa menajamkan apa pun.
+                val wait = if (castFloor <= 0) POLL_COARSE_MS else {
+                    val untilBoundary = castFloor - 500 - (System.currentTimeMillis() - tapAt)
+                    if (untilBoundary > POLL_NEAR_MS) minOf(untilBoundary, POLL_BLIND_MAX_MS)
+                    else POLL_NEAR_MS
+                }
+                kotlinx.coroutines.delay(wait)
                 if (isHandlingCaptcha || gardenPaused || !isRunning) return@launch
                 val s = captureScreen() ?: continue
                 poll++
@@ -1848,16 +2108,42 @@ class GardenService : AccessibilityService() {
                 // jaga-jaga template basi (mis. tampilan tombol berubah setelah update game).
                 val found = findOrb(s) != null
                 if (found) { s.recycle(); reappeared = true; break }
+                // BANNER PANEN (temuan user): "Obtained <item> × 1" menyapu NAIK dari bawah layar
+                // dan sempat menutupi orb tepat saat panen selesai. Akibatnya orb dianggap "belum
+                // muncul" padahal cast sudah kelar, dan jeda pickup baru mulai setelah banner
+                // lewat — ongkos itu dibayar sekali tiap panen. Banner itu sendiri bukti panen
+                // selesai, jadi dipakai sebagai batas alternatif (bukan pengganti: panen tanpa
+                // item mungkin tidak memunculkan banner sama sekali).
+                //
+                // OCR-nya sangat tersasar: hanya saat orb TIDAK terlihat DAN waktu sudah lewat
+                // ambang. Di siklus normal orb keburu ketemu duluan → nol OCR tambahan.
+                // Sengaja TIDAK memakai template posisi tetap: banner-nya bergerak.
+                // Chat di dasar layar juga memuat "Obtained ..." tapi ada di y>0.78, di luar
+                // jangkauan readCenterBand (0.32–0.58) — jadi bukan sumber salah picu.
+                if (System.currentTimeMillis() - tapAt >= obtainedAfterMs &&
+                    isObtainedToast(readCenterBand(s))) {
+                    Log.d(TAG, "banner 'Obtained' terbaca → panen selesai walau orb tertutup")
+                    s.recycle(); reappeared = true; occludedByBanner = true; break
+                }
                 val ocrEvery = if (confirmTemplate() != null) 6 else 2
                 if (interceptCaptcha(s, forceOcr = poll % ocrEvery == 0)) return@launch   // s milik handleCaptcha
                 s.recycle()
             }
             if (reappeared) {
-                Log.d(TAG, "tombol muncul lagi (cast selesai) → pickup ${DELAY_AFTER_GATHER}ms")
-                hud("✅ cast selesai → pickup ${DELAY_AFTER_GATHER / 1000.0}s")
+                // Durasi cast diukur dari tap sampai tombol terlihat lagi. Batas 500..15000
+                // membuang pengukuran yang jelas bukan cast (frame nyasar / timeout hampir kena).
+                val castMs = System.currentTimeMillis() - tapAt
+                if (castMs in 500L..15_000L) perf.record(PerfStats.CAST, castMs)
+                val pickup = pickupDelay()
+                Log.d(TAG, "cast ${castMs}ms (${if (occludedByBanner) "via banner" else "via orb"})" +
+                    " → pickup ${pickup}ms (konstanta ${DELAY_AFTER_GATHER}ms)")
+                // Penanda 📦 vs ✅ sengaja dibedakan: dari HUD langsung terlihat seberapa sering
+                // orb benar-benar tertutup banner, tanpa perlu adb.
+                hud(if (occludedByBanner) "📦 banner panen ${castMs / 1000.0}s → pickup ${pickup / 1000.0}s"
+                    else "✅ cast ${castMs / 1000.0}s → pickup ${pickup / 1000.0}s")
                 markGardenActivity()
                 expectReadyNext = true
-                handler.post { handler.postDelayed(loop, DELAY_AFTER_GATHER) }
+                handler.post { handler.postDelayed(loop, pickup) }
             } else {
                 Log.w(TAG, "tombol tak muncul lagi setelah 15s — mungkin popup/captcha → jalur OCR")
                 handler.post { handler.postDelayed(loop, 200) }
@@ -1875,7 +2161,7 @@ class GardenService : AccessibilityService() {
             val x = pos.first + (-8..8).random()
             val y = pos.second + (-8..8).random()
             Log.d(TAG, "Gardening orb match → tap ($x, $y)")
-            lastGardenTapMs = System.currentTimeMillis()
+            markGardenTap()
             performTap(x, y)
         } else {
             Log.d(TAG, "Gardening orb tidak match → fallback koordinat kalibrasi")
@@ -1896,6 +2182,11 @@ class GardenService : AccessibilityService() {
 
     /** SSD template match dibatasi kotak sekitar center (margin px). Generik utk orb & confirm captcha. */
     private fun findTemplateNear(
+        screen: Bitmap, tmpl: Bitmap, center: Pair<Float, Float>,
+        margin: Int, threshold: Double, tag: String
+    ): Pair<Float, Float>? = perf.time(tag) { findTemplateNearImpl(screen, tmpl, center, margin, threshold, tag) }
+
+    private fun findTemplateNearImpl(
         screen: Bitmap, tmpl: Bitmap, center: Pair<Float, Float>,
         margin: Int, threshold: Double, tag: String
     ): Pair<Float, Float>? {
