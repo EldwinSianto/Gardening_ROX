@@ -510,7 +510,14 @@ class GardenService : AccessibilityService() {
     // Delay constants (ms) â€" mirip Python
     private val DELAY_LOOP            = 3000L
     private val DELAY_AFTER_TAP       = 100L    // cek cepat setelah tap — status gather langsung terbaca
-    private val DELAY_AFTER_GATHER    = 5000L   // pickup 5 detik PAS (permintaan user)
+    // PERCOBAAN 2026-08-18: 5000 → 2500. Nilai 5000 dulu permintaan eksplisit user, tapi
+    // log MuMu menunjukkan siklus panen 11,8 dtk = cast ~6,8 dtk (dipaksakan game) + jeda ini
+    // 4,87 dtk — 41% waktu bot habis di konstanta yang KITA pilih. Banner "Obtained <item>"
+    // terbaca SEBELUM jeda ini mulai, jadi itemnya sudah di tangan saat bot masih menunggu.
+    // 20 siklus berturut-turut tanpa satu pun tap no-op → di 4,87 dtk tanaman pasti siap;
+    // yang belum diketahui adalah seberapa awal ia siap. Turunkan lalu hitung "tak bereaksi"
+    // di log: kalau tap mulai gagal, lantainya ketemu — noopTapStreak yang menahan tap.
+    private val DELAY_AFTER_GATHER    = 2500L
     private val DELAY_INSUFFICIENT    = 60_000L
     private val DELAY_PLANT_NOT_READY = 300_000L
     private val DELAY_CAPTCHA_TIMEOUT = 35_000L
