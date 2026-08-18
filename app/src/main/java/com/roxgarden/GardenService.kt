@@ -1016,6 +1016,11 @@ class GardenService : AccessibilityService() {
             sb.appendLine("Timing per langkah:")
             sb.appendLine(perf.report())
             sb.appendLine("  jeda pickup efektif=${pickupDelay()}ms (konstanta ${DELAY_AFTER_GATHER}ms)")
+            val audit = perf.countersReport()
+            if (audit.isNotEmpty()) {
+                sb.appendLine("Audit template vs OCR (fast-path):")
+                sb.appendLine(audit)
+            }
             cb(sb.toString())
         }
     }
@@ -1178,7 +1183,6 @@ class GardenService : AccessibilityService() {
                         val pos = findGardeningOrb(img, tmpl, center)
                         if (pos != null) {
                             ocrInProgress = false
-                            if (!img.isRecycled) img.recycle()
                             fastPathStreak++
                             Log.d(TAG, "FAST-PATH: orb siap → tap tanpa OCR (streak=$fastPathStreak)")
                             hud("⚡ tap Gardening (cepat)")
@@ -1186,6 +1190,9 @@ class GardenService : AccessibilityService() {
                             markGardenTap()
                             performTap(pos.first + (-8..8).random(), pos.second + (-8..8).random())
                             scheduleAfterTap(loop)
+                            // AUDIT template vs OCR — frame yang SAMA dibaca OCR secara async.
+                            // img jadi milik auditFastPath; dia yang me-recycle.
+                            auditFastPath(img)
                             return@launch
                         }
                     }
@@ -1388,6 +1395,64 @@ class GardenService : AccessibilityService() {
     // â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
     // REGION HELPERS â€" koordinat dari DebugOverlayManager (live, auto-saved)
     // â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+
+    // Audit hanya boleh SATU yang jalan: diagnosa boleh sampling, tapi menumpuk inferensi ONNX
+    // di emulator akan memperlambat capture yang justru sedang kita optimalkan.
+    @Volatile private var observeOcrBusy = false
+
+    /**
+     * AUDIT TEMPLATE vs OCR (permintaan user: "cek template dan OCR bersamaan, bukan sequence").
+     *
+     * Fast-path menyerahkan keputusan tap sepenuhnya ke template dan MELEWATI OCR — di siklus itu
+     * bot benar-benar buta, dan kalau template salah tidak ada apa pun yang bisa memberitahu.
+     * Itulah akar siklus phantom dulu, dan alasan lahirnya fastPathStreak/noopTapStreak.
+     * Fungsi ini membaca frame YANG SAMA dengan OCR lalu mencatat apakah keduanya sepakat.
+     *
+     * MURNI MENGAMATI: hasilnya TIDAK PERNAH mengubah perilaku bot (pilihan user: amati dulu).
+     * analyzeScreen sudah diperiksa bebas efek samping — tidak nge-tap, tidak menjadwal, tidak
+     * mengubah state, tidak me-recycle.
+     *
+     * Async, supaya tap tidak menunggu OCR — inti permintaannya: ongkos jadi max(), bukan jumlah.
+     * Sesi ONNX aman dipanggil konkuren (TextDetector/TextRecognizer cuma memegang referensi
+     * sesi; seluruh state kerjanya lokal per panggilan), yang naik hanya beban CPU.
+     *
+     * Kepemilikan bitmap: frame diserahkan ke fungsi ini, dan fungsi ini yang me-recycle —
+     * termasuk di jalur dilewati, supaya tidak ada frame 3.7MB yang bocor.
+     */
+    private fun auditFastPath(shot: Bitmap) {
+        if (observeOcrBusy) {
+            perf.bump("audit-dilewati")
+            if (!shot.isRecycled) shot.recycle()
+            return
+        }
+        observeOcrBusy = true
+        scope.launch {
+            try {
+                val v = try { perf.time(PerfStats.OCR) { analyzeScreen(shot) } }
+                        catch (t: Throwable) { null }
+                when (v?.type) {
+                    null -> perf.bump("audit-error")
+                    // Template dan OCR sepakat tombol memang siap dipanen.
+                    StatusType.GARDENING_READY -> perf.bump("audit-sepakat")
+                    // Tidak konklusif: OCR tak membaca apa pun yang menentukan (layar transisi).
+                    StatusType.NORMAL, StatusType.GAME_POPUP, StatusType.PANEL_STUCK ->
+                        perf.bump("audit-tak-jelas")
+                    // Sisanya = OCR punya status definitif yang BERTENTANGAN dengan "siap panen":
+                    // maturity, gathering, stamina, period, atau captcha. Artinya tap barusan
+                    // kemungkinan besar no-op — persis kasus yang dulu tak terlihat.
+                    else -> {
+                        perf.bump("audit-beda")
+                        perf.bump("audit-beda-${v.type}")
+                        Log.w(TAG, "AUDIT: template=orb siap, OCR=${v.type} → tap tadi kemungkinan no-op")
+                        hud("⚠ template≠OCR: ${v.type}")
+                    }
+                }
+            } finally {
+                if (!shot.isRecycled) shot.recycle()
+                observeOcrBusy = false
+            }
+        }
+    }
 
     private fun regionPx(id: String, bitmap: Bitmap): IntArray? {
         val r = debugOverlay?.getRegion(id) ?: return null

@@ -81,6 +81,27 @@ class PerfStats {
         stats[label]?.takeIf { it.n > 0 }?.min ?: 0L
     }
 
+    // ── PENCACAH AUDIT TEMPLATE vs OCR ─────────────────────────────────
+    // Bukan durasi, tapi ditaruh di kelas ini supaya semua angka yang tampil di HUD/DIAGNOSA
+    // punya satu rumah. Label dibuat dinamis (mis. "audit-beda-UNTIL_MATURITY") supaya
+    // rinciannya muncul sendiri tanpa perlu mendaftarkan tiap jenis lebih dulu.
+    private val counters = LinkedHashMap<String, Long>()
+
+    fun bump(label: String) {
+        synchronized(counters) { counters[label] = (counters[label] ?: 0L) + 1 }
+    }
+
+    fun count(label: String): Long = synchronized(counters) { counters[label] ?: 0L }
+
+    /** Rincian pencacah untuk DIAGNOSA; string kosong kalau belum ada satu pun. */
+    fun countersReport(): String {
+        val snap = synchronized(counters) { counters.toList() }
+        if (snap.isEmpty()) return ""
+        val sb = StringBuilder()
+        for ((k, v) in snap.sortedByDescending { it.second }) sb.appendLine("  " + k.padEnd(28) + v)
+        return sb.toString().trimEnd()
+    }
+
     fun reset() = synchronized(stats) { stats.clear() }
 
     /**
