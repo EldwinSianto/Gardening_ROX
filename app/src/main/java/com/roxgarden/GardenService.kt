@@ -517,7 +517,21 @@ class GardenService : AccessibilityService() {
     // 20 siklus berturut-turut tanpa satu pun tap no-op → di 4,87 dtk tanaman pasti siap;
     // yang belum diketahui adalah seberapa awal ia siap. Turunkan lalu hitung "tak bereaksi"
     // di log: kalau tap mulai gagal, lantainya ketemu — noopTapStreak yang menahan tap.
-    private val DELAY_AFTER_GATHER    = 2500L
+    // Percobaan ke-2: 2500 -> 1200. Di 2500 hasilnya 0 no-op dari 8 siklus, artinya lantainya
+    // belum tersentuh. Langkahnya sengaja tidak lebih agresif dari ini: tiap tap no-op
+    // membangunkan TAP_HOLD_MS (15 dtk), jadi menembak terlalu jauh ke bawah justru lebih
+    // lambat daripada nilai yang kekecilan sedikit.
+    private val DELAY_AFTER_GATHER    = 1200L
+
+    // JANGAN samakan dengan DELAY_AFTER_GATHER — dua hal yang berbeda, dan menyamakannya
+    // sudah pernah bikin regresi (2026-08-18, tertangkap oleh audit template-vs-OCR).
+    //
+    // DELAY_AFTER_GATHER dipakai SESUDAH batas cast terdeteksi: gather sudah pasti selesai,
+    // jeda ini murni untuk pickup. Konstanta di bawah dipakai saat OCR membaca status
+    // "Gathering" — di situ kita TIDAK tahu gather sudah berjalan berapa lama, jadi jedanya
+    // harus cukup untuk satu cast penuh. Dengan 1200 bot men-tap di tengah gather: 7 dari 20
+    // tap fast-path jadi no-op, dan siklus terlihat "cepat" padahal cuma berputar sia-sia.
+    private val DELAY_GATHERING_WAIT  = 5000L
     private val DELAY_INSUFFICIENT    = 60_000L
     private val DELAY_PLANT_NOT_READY = 300_000L
     private val DELAY_CAPTCHA_TIMEOUT = 35_000L
@@ -1338,11 +1352,12 @@ class GardenService : AccessibilityService() {
                             }
                         }
                         StatusType.GATHERING -> {
-                            Log.d(TAG, "Gathering, tunggu ${DELAY_AFTER_GATHER}ms")
-                            val pickup = pickupDelay()
-                            hud("🌾 gathering → ambil ${pickup / 1000.0}s")
-                            expectReadyNext = true   // habis pickup, tombol biasanya langsung siap → fast-path
-                            handler.postDelayed(loop, pickup)
+                            Log.d(TAG, "Gathering, tunggu ${DELAY_GATHERING_WAIT}ms")
+                            // Pakai DELAY_GATHERING_WAIT, BUKAN pickupDelay(): posisi kita di
+                            // tengah gather yang entah sudah sejauh mana, bukan sesudahnya.
+                            hud("🌾 gathering → tunggu ${DELAY_GATHERING_WAIT / 1000.0}s")
+                            expectReadyNext = true   // habis gather, tombol biasanya langsung siap → fast-path
+                            handler.postDelayed(loop, DELAY_GATHERING_WAIT)
                         }
                         StatusType.GARDENING_READY -> {
                             if (!shouldGardenNow()) {
