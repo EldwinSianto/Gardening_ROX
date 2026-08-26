@@ -58,6 +58,11 @@ class CityNavigator(
         // pernah nyangkut terbuka dan bikin garden loop diam berjam-jam.
         private val PANEL_MARKERS = listOf(
             "encyclopedia", "common area", "gardening exp", "growth time",
+            // panel Carnival & Mission Board (dipakai fitur Daily Mission). Tanpa ini
+            // readScreenState mengembalikan UNKNOWN dan closePanels MENOLAK menekan Back,
+            // sehingga panel tertinggal terbuka dan garden loop buta selamanya.
+            "mission board", "bounty quest", "trial illusion", "endless tower",
+            "mission progress", "quests refresh", "complete immediately",
             // region view (tap minimap) DAN world map (grid kota) — teksnya beda, daftarkan keduanya
             "map info", "monsters on current map", "quests on current map", "lifeskill area",
             "affiliated areas", "defending guild"

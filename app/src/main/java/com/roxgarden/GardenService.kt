@@ -423,6 +423,66 @@ class GardenService : AccessibilityService() {
             back = { performGlobalAction(GLOBAL_ACTION_BACK) }
         )
     }
+
+    // ── DAILY MISSION (fitur terpisah, bisa dibuang) ──────────────────────
+    private val dailyMissionRunner by lazy {
+        DailyMissionRunner(
+            capture = { captureScreen() },
+            tap = { x, y -> performTap(x, y) },
+            swipe = { x1, y1, x2, y2, dur -> performSwipe(x1, y1, x2, y2, dur) },
+            ocrProvider = { ocrProcessor },
+            loadAsset = { path ->
+                try { android.graphics.BitmapFactory.decodeStream(assets.open(path)) }
+                catch (_: Throwable) { null }
+            },
+            hud = { text -> hud(text) },
+            checkCaptcha = { shot -> interceptCaptcha(shot) },
+            isCaptchaActive = { isHandlingCaptcha },
+            closePanels = { cityNavigator.closePanels() },
+            markActivity = { markGardenActivity() }
+        )
+    }
+
+    /**
+     * Pemicu Daily Mission. KONTRAK WAJIB: gardenLoop.run() TIDAK menjadwalkan ulang dirinya
+     * saat gardenPaused true — ia return begitu saja. Jadi siapa pun yang mem-pause WAJIB
+     * mem-post ulang loop di finally. Kalau terlewat, gardening MATI DIAM-DIAM sampai app
+     * di-restart: tanpa error, tanpa gejala di HUD.
+     *
+     * markGardenActivity() juga wajib: run bisa 10-30 menit sedangkan GARDEN_STUCK_MS cuma
+     * 5 menit, jadi tanpa reset watchdog langsung memicu navigasi ulang yang tak perlu.
+     */
+    fun startDailyMission(maxMissions: Int) {
+        if (gardenPaused || isHandlingCaptcha) {
+            Log.w(TAG, "Daily mission ditolak: bot sedang sibuk (paused=$gardenPaused captcha=$isHandlingCaptcha)")
+            hud("⚠ daily mission ditolak, bot sibuk")
+            return
+        }
+        gardenPaused = true
+        handler.removeCallbacks(gardenLoop)
+        scope.launch {
+            try {
+                dailyMissionRunner.run(maxMissions)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Daily mission crash: ${t.javaClass.simpleName}: ${t.message}")
+                hud("💥 daily mission error")
+            } finally {
+                markGardenActivity()
+                gardenPaused = false
+                handler.post { handler.postDelayed(gardenLoop, 6000) }
+                Log.d(TAG, "=== DAILY MISSION selesai, gardening lanjut ===")
+            }
+        }
+    }
+
+    // Trigger test via ADB: adb shell am broadcast -a com.roxgarden.DAILY_MISSION --ei max 0
+    private val dailyMissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val max = intent?.getIntExtra("max", 10) ?: 10
+            Log.d(TAG, "DAILY MISSION dipicu manual via broadcast (max=$max)")
+            startDailyMission(max)
+        }
+    }
     // Trigger test via ADB: adb shell am broadcast -a com.roxgarden.SCAN_WEATHER
     private val weatherTestReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -673,6 +733,10 @@ class GardenService : AccessibilityService() {
         val sf = IntentFilter("com.roxgarden.STUCK_TEST")
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(stuckTestReceiver, sf, Context.RECEIVER_EXPORTED)
         else registerReceiver(stuckTestReceiver, sf)
+        // ── DAILY MISSION test trigger (removable) ──
+        val df = IntentFilter("com.roxgarden.DAILY_MISSION")
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(dailyMissionReceiver, df, Context.RECEIVER_EXPORTED)
+        else registerReceiver(dailyMissionReceiver, df)
         // ───────────────────────────────────────
     }
 
@@ -895,6 +959,7 @@ class GardenService : AccessibilityService() {
         try { unregisterReceiver(navTestReceiver) } catch (_: Throwable) {}      // CITY NAV (removable)
         try { unregisterReceiver(panelTestReceiver) } catch (_: Throwable) {}    // CITY NAV (removable)
         try { unregisterReceiver(stuckTestReceiver) } catch (_: Throwable) {}    // CITY NAV (removable)
+        try { unregisterReceiver(dailyMissionReceiver) } catch (_: Throwable) {}  // DAILY MISSION (removable)
         // Shell root persisten hidup selama service — tanpa ini prosesnya menggantung setelah
         // service mati (dan `su` yatim tetap memegang fd).
         closeRootShell()
@@ -1774,7 +1839,11 @@ class GardenService : AccessibilityService() {
         // world map (grid kota) — teksnya BEDA dari region view; keduanya harus terdaftar
         "affiliated areas" in lower || "defending guild" in lower ||
         // panel gardening
-        "encyclopedia" in lower || "common area" in lower || "growth time" in lower
+        "encyclopedia" in lower || "common area" in lower || "growth time" in lower ||
+        // panel Carnival & Mission Board — supaya panel yang tertinggal terbuka dari
+        // Daily Mission juga bisa dipulihkan lewat jalur PANEL_STUCK gardening
+        "mission board" in lower || "bounty quest" in lower || "trial illusion" in lower ||
+        "mission progress" in lower || "quests refresh" in lower
 
     // Counter status NORMAL beruntun — untuk fallback deteksi popup full-screen
     private var normalStreak = 0
