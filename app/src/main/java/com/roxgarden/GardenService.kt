@@ -452,7 +452,7 @@ class GardenService : AccessibilityService() {
      * markGardenActivity() juga wajib: run bisa 10-30 menit sedangkan GARDEN_STUCK_MS cuma
      * 5 menit, jadi tanpa reset watchdog langsung memicu navigasi ulang yang tak perlu.
      */
-    fun startDailyMission(maxMissions: Int) {
+    fun startDailyMission(maxMissions: Int, skipNav: Boolean = false) {
         if (gardenPaused || isHandlingCaptcha) {
             Log.w(TAG, "Daily mission ditolak: bot sedang sibuk (paused=$gardenPaused captcha=$isHandlingCaptcha)")
             hud("⚠ daily mission ditolak, bot sibuk")
@@ -462,7 +462,7 @@ class GardenService : AccessibilityService() {
         handler.removeCallbacks(gardenLoop)
         scope.launch {
             try {
-                dailyMissionRunner.run(maxMissions)
+                dailyMissionRunner.run(maxMissions, skipNav)
             } catch (t: Throwable) {
                 Log.e(TAG, "Daily mission crash: ${t.javaClass.simpleName}: ${t.message}")
                 hud("💥 daily mission error")
@@ -476,11 +476,13 @@ class GardenService : AccessibilityService() {
     }
 
     // Trigger test via ADB: adb shell am broadcast -a com.roxgarden.DAILY_MISSION --ei max 0
+    // Tambah --ez skipnav true untuk langsung ke loop misi (lewati navigasi papan) saat menyetel.
     private val dailyMissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val max = intent?.getIntExtra("max", 10) ?: 10
-            Log.d(TAG, "DAILY MISSION dipicu manual via broadcast (max=$max)")
-            startDailyMission(max)
+            val skipNav = intent?.getBooleanExtra("skipnav", false) ?: false
+            Log.d(TAG, "DAILY MISSION dipicu manual via broadcast (max=$max skipnav=$skipNav)")
+            startDailyMission(max, skipNav)
         }
     }
     // Trigger test via ADB: adb shell am broadcast -a com.roxgarden.SCAN_WEATHER
