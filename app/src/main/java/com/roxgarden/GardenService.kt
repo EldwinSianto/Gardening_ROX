@@ -467,6 +467,25 @@ class GardenService : AccessibilityService() {
                 Log.e(TAG, "Daily mission crash: ${t.javaClass.simpleName}: ${t.message}")
                 hud("💥 daily mission error")
             } finally {
+                // Misi harian meninggalkan karakter di map mana pun (Comodo Cave, Sograt
+                // Desert, ...). Gardening akan BUTA di sana sampai watchdog 5 menit menyala,
+                // jadi navigasi balik dilakukan sekarang selagi gardenPaused masih true.
+                //
+                // currentCity/currentPlantId WAJIB direset dulu: keduanya mencatat lokasi
+                // terakhir untuk GARDENING, dan sesudah misi keduanya basi. Tanpa reset,
+                // planAndNavigate() membandingkan tujuan dengan catatan basi itu,
+                // menyimpulkan "sudah di lokasi", lalu tidak pindah ke mana-mana.
+                try {
+                    currentCity = null
+                    currentPlantId = null
+                    reloadPlantSelection()
+                    if (!planAndNavigate()) {
+                        Log.w(TAG, "navigasi balik ke kebun tidak jalan (tidak ada boost?) — " +
+                            "gardening mengandalkan watchdog")
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "navigasi balik ke kebun gagal: ${t.message}")
+                }
                 markGardenActivity()
                 gardenPaused = false
                 handler.post { handler.postDelayed(gardenLoop, 6000) }

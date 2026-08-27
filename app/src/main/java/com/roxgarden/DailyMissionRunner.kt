@@ -106,6 +106,20 @@ class DailyMissionRunner(
         private const val SUBMIT_TIMEOUT_MS = 5 * 60_000L
         private const val SUBMIT_POLL_MS = 2000L
 
+        // Bot bisa terjebak diam: misi menunjuk map LAIN (terukur di device — karakter di
+        // Sograt Desert sedangkan sasarannya Comodo Cave), tapi tidak ada apa pun di layar
+        // yang bisa ditekan karena tawaran Fly Wing hanya muncul saat quest di-tap.
+        // Kalau sekian lama tidak ada aksi, tap ulang quest untuk memancing tawaran itu.
+        // 90 detik, bukan 45: misi tipe KILL wajar tidak menyentuh UI sama sekali selama
+        // puluhan detik (terukur di device: "Kill Megalodon 8/10" sementara layar diam).
+        // Ambang 45 detik memicu nudge pada misi yang justru sedang berjalan sehat.
+        private const val NUDGE_AFTER_MS = 90_000L
+        private const val NUDGE_MAX = 3
+
+        // Tombol X popup Fly Wing, terukur di frame kanonik ~(935,250).
+        private const val FLY_WING_CLOSE_X = 0.730f
+        private const val FLY_WING_CLOSE_Y = 0.347f
+
         private const val D_NAV = 2000L      // jeda antar langkah navigasi panel
         private const val D_SETTLE = 1200L   // jeda setelah tap tombol teks
 
@@ -122,21 +136,46 @@ class DailyMissionRunner(
         // persis, (866,275) kanonik, dengan labelnya sedikit di bawah. Kotak sempit ini juga
         // aman: di area itu tidak ada elemen UI lain — menu kanan mulai dari x>0.70 dan
         // berada lebih ke bawah.
-        // Kotak dipersempit dari 0.62 ke 0.65: pada 0.62 (=794px) kotak masih menangkap
-        // potongan teks menu kanan — terukur di device sebagai 'GV' (dari "GVG League") di
-        // x=810, dan bot menekannya sehingga popup lain terbuka.
-        private val INTERACT_RECT = floatArrayOf(0.65f, 0.36f, 0.73f, 0.46f)
+        // Kotak SANGAT sempit di sumbu x, dan itu disengaja. Baris toolbar atas ("Good
+        // Tidings / GVG League / Companion UP Gacha / Amazing Events") berada di pita y YANG
+        // SAMA dengan label tombol interaksi, jadi posisi vertikal tidak bisa memisahkan
+        // keduanya. Yang memisahkan: item toolbar berjarak ~77px pada x = 737, 814, 892, 968,
+        // sedangkan label tombol interaksi selalu terpusat di x=866 — tepat di celah antara
+        // 814 dan 892.
+        //
+        // Riwayat: 0.62 menangkap 'GV' (dari "GVG League"), 0.65 masih menangkap 'npanion'
+        // (dari "Companion UP Gacha") dan membuat bot menekan titik yang sama 12x berturut-turut.
+        // Pita pencarian ikon tangan: SEMPIT, hanya +-20px di sekitar posisi sebenarnya
+        // (ikon di (847,251)..(885,289) kanonik). Versi longgar sebelumnya (0.62..0.75 x
+        // 0.28..0.47) membuat template mendarat di ikon toolbar dan bot MEMBUKA panel
+        // "Companion UP Gacha".
+        private val INTERACT_HAND_RECT = floatArrayOf(0.646f, 0.322f, 0.712f, 0.432f)
+
+        // Ambang KHUSUS ikon tangan, jauh lebih ketat dari TEMPLATE_THRESHOLD umum.
+        // Terukur di device: match PALSU menghasilkan SSD 5000-12000, semuanya lolos ambang
+        // umum 14000. Template ini kecil (38x38) dan mayoritas putih, jadi ia mudah cocok
+        // dengan sembarang area terang kalau ambangnya longgar.
+        private const val INTERACT_HAND_THRESHOLD = 2500.0
+
+        // Pengaman: label interaksi yang sama ditemukan berkali-kali tanpa Submit muncul
+        // berarti yang terbaca BUKAN tombol interaksi. Berhenti menekannya alih-alih
+        // berputar diam-diam sampai timeout 5 menit.
+        private const val INTERACT_MAX_REPEAT = 3
 
         // Titik tap tombol interaksi, BUKAN titik teksnya. Teks yang ditemukan hanyalah LABEL
         // di bawah tombol (terukur: label "Search" di y=304, lingkaran emasnya di y=275) —
         // menekan label tidak memicu apa pun, terlihat di log sebagai 'Search' ditekan 4×
         // berturut-turut tanpa reaksi. Posisi tombolnya sendiri konsisten di kedua misi.
-        private const val INTERACT_TAP_X = 0.677f
-        private const val INTERACT_TAP_Y = 0.382f
 
         // Ikon Fly Wing di popup, terukur di device pada (828,267)..(902,341) kanonik.
-        // Pita dilebarkan sedikit dari itu untuk menoleransi pergeseran popup.
-        private val FLY_WING_RECT = floatArrayOf(0.58f, 0.30f, 0.78f, 0.55f)
+        // Pita hanya +-15px dari itu: versi longgar (0.58..0.78) membuat template mendarat
+        // di (742,288) dengan SSD 7372 padahal popupnya TIDAK ADA, dan bot mengira ada misi
+        // siap terbang.
+        private val FLY_WING_RECT = floatArrayOf(0.635f, 0.351f, 0.717f, 0.497f)
+
+        // Ambang khusus Fly Wing. Terukur: match ASLI 257-320, match PALSU 7372. Ambang umum
+        // 14000 meloloskan keduanya; 2000 memberi jarak lebar ke kedua sisi.
+        private const val FLY_WING_THRESHOLD = 2000.0
     }
 
     private val templateCache = mutableMapOf<String, Bitmap?>()
@@ -203,7 +242,8 @@ class DailyMissionRunner(
     // konsekuensi aturan "fitur terpisah = hapus file + blok pemanggil = hilang bersih".
     // JANGAN diekstrak jadi util bersama.
     private fun findTemplate(
-        screen: Bitmap, tmpl: Bitmap, rectFrac: FloatArray? = null
+        screen: Bitmap, tmpl: Bitmap, rectFrac: FloatArray? = null,
+        threshold: Double = TEMPLATE_THRESHOLD
     ): Pair<Float, Float>? {
         val sw = screen.width; val sh = screen.height
         val tw = tmpl.width;  val th = tmpl.height
@@ -244,7 +284,7 @@ class DailyMissionRunner(
         val sampled = ((tw + step - 1) / step) * ((th + step - 1) / step)
         val avg = bestSsd.toDouble() / sampled
         Log.d(TAG, "SSD=${"%.0f".format(avg)} pos=($bestDx,$bestDy)")
-        return if (avg <= TEMPLATE_THRESHOLD) (bestDx + tw / 2f) to (bestDy + th / 2f) else null
+        return if (avg <= threshold) (bestDx + tw / 2f) to (bestDy + th / 2f) else null
     }
 
     /**
@@ -283,11 +323,12 @@ class DailyMissionRunner(
      * (~30ms) menggantikan OCR (~1-2 detik) di jalur yang sering dilewati.
      */
     private suspend fun locateTemplate(
-        assetPath: String, label: String, rectFrac: FloatArray? = null
+        assetPath: String, label: String, rectFrac: FloatArray? = null,
+        threshold: Double = TEMPLATE_THRESHOLD
     ): Pair<Float, Float>? {
         val tmpl = getTemplate(assetPath) ?: return null
         val screen = captureStable() ?: return null
-        val pos = withContext(Dispatchers.Default) { findTemplate(screen, tmpl, rectFrac) }
+        val pos = withContext(Dispatchers.Default) { findTemplate(screen, tmpl, rectFrac, threshold) }
         screen.recycle()
         if (pos != null) Log.d(TAG, "template '$label' ada di (${pos.first.toInt()},${pos.second.toInt()})")
         return pos
@@ -603,8 +644,17 @@ class DailyMissionRunner(
      * Captcha tetap dicek tiap poll — ongkosnya murah lewat template yang sudah ada, jadi
      * tidak diasumsikan captcha mustahil muncul di luar konteks gardening.
      */
+    // Pelacak label interaksi — direset tiap misi, dipakai pengaman anti-tekan-berulang.
+    private var interactRepeats = 0
+
     private suspend fun waitForSubmit(missionNo: Int): Boolean {
+        interactRepeats = 0
         val start = System.currentTimeMillis()
+        var lastAction = start
+        var nudges = 0
+        // Sidik teks tracker saat pemeriksaan nudge terakhir. Hitungan kill di tracker
+        // ("8/10") berubah saat misi maju, jadi perubahan sidik = BUKTI kemajuan.
+        var lastTrackerFp = ""
         while (System.currentTimeMillis() - start < SUBMIT_TIMEOUT_MS) {
             delay(SUBMIT_POLL_MS)
 
@@ -627,6 +677,25 @@ class DailyMissionRunner(
             // Cutscene dialog NPC menghalangi Submit dan tidak selesai sendiri.
             if (skipCutsceneIfAny()) continue
 
+            // FLY WING DI TENGAH MISI (temuan user): satu misi bisa punya beberapa titik
+            // tujuan — sesudah bicara dengan NPC, game menawarkan terbang ke titik
+            // berikutnya. Versi sebelumnya hanya menekan Fly Wing SEKALI di awal misi,
+            // sehingga tawaran berikutnya diabaikan dan karakter terpaksa jalan kaki
+            // (atau diam sampai timeout).
+            //
+            // Gerbangnya TEMPLATE (~30ms) dan OCR (tapWing, ~1-2 detik) hanya dijalankan
+            // kalau template lolos — kalau tidak, tiap poll 2 detik akan membayar OCR penuh.
+            if (locateTemplate("map_icons/fly_wing.png", "Fly Wing",
+                    FLY_WING_RECT, FLY_WING_THRESHOLD) != null) {
+                if (tapWing(WingKind.FLY)) {
+                    Log.d(TAG, "Fly Wing di tengah misi -> terbang ke titik berikutnya")
+                    hud("terbang ke titik berikutnya")
+                    lastAction = System.currentTimeMillis()
+                    delay(D_TRANSPORT)
+                    continue
+                }
+            }
+
             // Misi tipe ambil/interaksi memunculkan tombol bulat di kanan-tengah saat karakter
             // sampai ("Distance to target: 0 m"). LABELNYA BERBEDA-BEDA per misi — terukur di
             // device: "Check" untuk Morning Glory, bukan "Take" seperti dugaan awal. Karena
@@ -635,17 +704,79 @@ class DailyMissionRunner(
             //
             // minXFrac 0.45 penting: teks quest di tracker kiri bisa memuat kata yang sama
             // ("Check the ...") dan tap ke situ hanya akan memilih ulang quest, bukan interaksi.
-            val btn = findAnyTextIn(INTERACT_RECT)
+            // Tombol interaksi dicari lewat TEMPLATE IKON TANGAN, bukan teks. Alasannya
+            // terukur di device: labelnya berganti tiap misi ("Check", "Search", "Gather"),
+            // dan yang menutup jalan pendekatan berbasis teks adalah letaknya — label itu
+            // MENINDIH teks toolbar "Companion UP Gacha" di pita y yang sama, sehingga OCR
+            // di titik itu saling bertabrakan dan bot berhenti mengenalinya.
+            //
+            // Yang di-template hanya IKON TANGANNYA, bukan lingkaran emasnya: lingkaran itu
+            // semi-transparan (teks toolbar tembus di baliknya) sehingga SSD-nya bergoyang,
+            // sedangkan ikon tangan opak dan stabil.
+            val btn = locateTemplate(
+                "map_icons/interact_hand.png", "tombol interaksi",
+                INTERACT_HAND_RECT, INTERACT_HAND_THRESHOLD
+            )
             if (btn != null) {
-                // Tap LINGKARAN tombolnya, bukan koordinat teks yang ditemukan — teks itu
-                // cuma label di bawahnya dan menekannya tidak memicu apa pun.
-                val tx = INTERACT_TAP_X * canonW()
-                val ty = INTERACT_TAP_Y * canonH()
-                Log.d(TAG, "tombol interaksi '${btn.third}' (label di y=${btn.second.toInt()}) -> tap (${tx.toInt()},${ty.toInt()})")
-                hud("interaksi: ${btn.third}")
-                tap(tx, ty)
-                delay(D_SETTLE)
-                continue
+                interactRepeats++
+                if (interactRepeats > INTERACT_MAX_REPEAT) {
+                    if (interactRepeats == INTERACT_MAX_REPEAT + 1) {
+                        Log.w(TAG, "tombol interaksi ditekan ${INTERACT_MAX_REPEAT}x tanpa hasil -> berhenti menekannya")
+                        hud("interaksi tak bereaksi, berhenti menekan")
+                    }
+                } else {
+                    Log.d(TAG, "tombol interaksi (ke-$interactRepeats) -> tap (${btn.first.toInt()},${btn.second.toInt()})")
+                    hud("interaksi objek misi")
+                    tap(btn.first, btn.second)
+                    lastAction = System.currentTimeMillis()
+                    delay(D_SETTLE)
+                    continue
+                }
+            }
+
+            // Tidak ada aksi sekian lama -> kemungkinan misi menunjuk map lain dan tawaran
+            // Fly Wing belum muncul. Tap ulang entry [Daily] teratas untuk memancingnya.
+            if (nudges < NUDGE_MAX && System.currentTimeMillis() - lastAction > NUDGE_AFTER_MS) {
+                val t = readTracker()
+
+                // Diam di layar BUKAN berarti macet. Kalau teks tracker berubah sejak
+                // pemeriksaan terakhir, misi sedang maju (hitungan kill bertambah) —
+                // jangan diganggu.
+                if (t.fingerprint.isNotEmpty() && t.fingerprint != lastTrackerFp) {
+                    Log.d(TAG, "tracker berubah -> misi masih maju, nudge dibatalkan")
+                    lastTrackerFp = t.fingerprint
+                    lastAction = System.currentTimeMillis()
+                    continue
+                }
+                lastTrackerFp = t.fingerprint
+
+                nudges++
+                val e = t.dailyEntries.firstOrNull()
+                if (e != null) {
+                    Log.d(TAG, "diam ${NUDGE_AFTER_MS / 1000}s -> tap ulang quest (nudge $nudges/$NUDGE_MAX)")
+                    hud("misi $missionNo: pancing tujuan berikutnya")
+                    tap(e.first, e.second)
+                    lastAction = System.currentTimeMillis()
+                    delay(D_SETTLE)
+
+                    // Tap ini biasanya memunculkan tawaran FLY WING. SENGAJA TIDAK DIPAKAI
+                    // (permintaan user): bot sampai di sini justru karena macet, dan
+                    // penyebabnya map tujuan BELUM TERBUKA — terbang ke sana tidak menolong
+                    // dan hanya menghabiskan item. Perjalanan ke map baru harus manual.
+                    //
+                    // Bedakan dengan Fly Wing yang muncul SENDIRI di tengah misi: yang itu
+                    // tetap dipakai, karena menandakan tujuan berikutnya memang terjangkau.
+                    val w = findWingDialog()
+                    if (w != null && w.kind == WingKind.FLY) {
+                        Log.d(TAG, "Fly Wing muncul akibat nudge -> TIDAK dipakai, ditutup")
+                        hud("lewati Fly Wing (map terkunci?)")
+                        tap(FLY_WING_CLOSE_X * canonW(), FLY_WING_CLOSE_Y * canonH())
+                        delay(D_SETTLE)
+                    }
+                    continue
+                }
+                Log.d(TAG, "nudge $nudges: tidak ada entry [Daily] terlihat")
+                lastAction = System.currentTimeMillis()
             }
 
             if (findTextBox("submit", 0.30f, 0.95f) != null) {
@@ -666,6 +797,9 @@ class DailyMissionRunner(
      */
     private suspend fun runMissionLoop(maxMissions: Int): Int {
         var done = 0
+        // Jalur "sudah di lokasi" hanya dicoba SEKALI per run: kalau ternyata memang tidak ada
+        // misi berjalan, mengulanginya berarti membakar 5 menit timeout tiap putaran.
+        var submitWaitedOnce = false
         while (done < maxMissions) {
             val no = done + 1
 
@@ -679,7 +813,7 @@ class DailyMissionRunner(
             // Carnival yang semi-transparan di atas adegan 3D dan nilainya bergoyang.
             hud("misi $no: cek Fly Wing")
             var flying = false
-            if (locateTemplate("map_icons/fly_wing.png", "Fly Wing", FLY_WING_RECT) != null) {
+            if (locateTemplate("map_icons/fly_wing.png", "Fly Wing", FLY_WING_RECT, FLY_WING_THRESHOLD) != null) {
                 Log.d(TAG, "template Fly Wing ada -> langsung terbang, lewati pencarian tracker")
                 if (tapWing(WingKind.FLY)) flying = true
                 else Log.w(TAG, "ikon Fly Wing terlihat tapi tombol Use tak bisa ditekan")
@@ -691,6 +825,27 @@ class DailyMissionRunner(
                 // maupun sisa sebagian (mis. sebagian sudah dikerjakan manual).
                 hud("misi $no: pilih quest")
                 if (!selectMissionBoardQuest()) {
+                    // Tidak ada entry yang memunculkan Fly Wing. Itu BELUM tentu berarti misi
+                    // habis: wing hanya muncul kalau perlu berpindah map, sedangkan misi yang
+                    // karakternya SUDAH di lokasi (terlihat di tracker sebagai "Distance to
+                    // target: 19 m", kill 8/10) tidak memunculkannya sama sekali.
+                    //
+                    // Jadi sebelum menyerah, tunggu Submit sekali untuk quest yang sedang
+                    // terpilih. Kalau memang tidak ada misi berjalan, timeout yang menutupnya.
+                    if (done == 0 || !submitWaitedOnce) {
+                        submitWaitedOnce = true
+                        Log.d(TAG, "tidak ada wing -> mungkin misi sudah berjalan di lokasi, tunggu Submit")
+                        hud("misi $no: sudah di lokasi?")
+                        if (waitForSubmit(no)) {
+                            hud("misi $no: Submit")
+                            if (tapTextButton("submit", 0.30f, 0.95f)) {
+                                done++; markActivity()
+                                Log.d(TAG, "misi $no SELESAI via jalur sudah-di-lokasi (total $done)")
+                                delay(D_NAV)
+                                continue
+                            }
+                        }
+                    }
                     Log.d(TAG, "tidak ada misi Mission Board tersisa -> SELESAI ($done misi)")
                     return done
                 }
