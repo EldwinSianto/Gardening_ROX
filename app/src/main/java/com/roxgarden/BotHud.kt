@@ -20,7 +20,17 @@ import android.view.WindowManager
  */
 class BotHud(
     private val context: Context,
-    private val windowManager: WindowManager
+    // Context/WindowManager DIAMBIL SAAT overlay ditampilkan, bukan saat objek ini dibuat.
+    //
+    // Sebabnya terukur di device (dumpsys window): overlay mendarat di mDisplayId=0
+    // sedangkan game jalan di display 14 - MuMu memberi tiap tab display virtual sendiri.
+    // Window-nya ADA dan tidak error sama sekali; ia cuma tergambar di layar yang tidak
+    // dilihat siapa pun. Ini masalah yang sama dengan refreshGameDisplay() pada capture
+    // ("id display game tidak boleh diasumsikan 0"), tapi di sisi PENEMPATAN window.
+    //
+    // Diambil belakangan karena id display game belum diketahui saat service tersambung -
+    // baru terisi sesudah refreshGameDisplay() berjalan.
+    private val overlayContext: () -> Context = { context }
 ) {
     companion object {
         private const val TAG = "BotHud"
@@ -44,9 +54,13 @@ class BotHud(
     private val marks = mutableListOf<TapMark>()
     @Volatile private var statsLine = ""       // baris timing permanen (paling bawah panel)
 
+    private var usedWm: WindowManager? = null
+
     fun show() {
         if (isShowing) return
-        val v = HudView(context)
+        val ctx = overlayContext()
+        val wm = ctx.getSystemService(WindowManager::class.java)
+        val v = HudView(ctx)
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -57,7 +71,8 @@ class BotHud(
             PixelFormat.TRANSLUCENT
         )
         try {
-            windowManager.addView(v, params)
+            wm.addView(v, params)
+            usedWm = wm
             view = v
             isShowing = true
             Log.d(TAG, "HUD ON")
@@ -67,7 +82,10 @@ class BotHud(
     }
 
     fun hide() {
-        view?.let { runCatching { windowManager.removeView(it) } }
+        // WAJIB dilepas lewat WindowManager yang SAMA dengan yang memasangnya - wm milik
+        // display lain tidak mengenal view ini dan removeView-nya melempar.
+        view?.let { v -> runCatching { (usedWm ?: context.getSystemService(WindowManager::class.java)).removeView(v) } }
+        usedWm = null
         view = null
         isShowing = false
         Log.d(TAG, "HUD OFF")

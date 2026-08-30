@@ -87,6 +87,21 @@ class MainActivity : AppCompatActivity() {
                 startService(Intent(this, GardenService::class.java).apply { action = "HUD" })
             }
         }
+        // Toggle kotak region HIDUP sementara bot jalan. Beda dari tombol DEBUG di bawah:
+        // DEBUG membuka mode kalibrasi yang MENJEDA bot supaya region bisa digeser jari,
+        // sedangkan ini hanya menonton — bot terus bekerja dan overlay tidak menerima
+        // sentuhan sama sekali, jadi gesture bot tetap tembus ke game.
+        val btnWatch = Button(this).apply { text = "🔲 KOTAK REGION (LIVE)" }
+        (btnHud.parent as ViewGroup).let { p -> p.addView(btnWatch, p.indexOfChild(btnHud) + 1) }
+        btnWatch.setOnClickListener {
+            if (GardenService.instance == null) {
+                tvStatus.text = "Status: Aktifkan Accessibility dulu"
+            } else {
+                startService(Intent(this, GardenService::class.java).apply { action = "WATCH" })
+                tvStatus.text = "Status: kotak region live di-toggle"
+            }
+        }
+
         btnDiag.setOnClickListener {
             val svc = GardenService.instance
             if (svc == null) {

@@ -27,3 +27,6 @@ captcha_train/captcha_rec.onnx
 
 # Log training/inference (regenerable)
 captcha_train/*.log
+
+# Screenshot debug ad-hoc dari adb exec-out screencap (bukan aset)
+.tmp_*.png

@@ -10,7 +10,17 @@ import kotlin.math.hypot
 
 class DebugOverlayManager(
     private val context: Context,
-    private val windowManager: WindowManager
+    // Context/WindowManager DIAMBIL SAAT overlay ditampilkan, bukan saat objek ini dibuat.
+    //
+    // Sebabnya terukur di device (dumpsys window): overlay mendarat di mDisplayId=0
+    // sedangkan game jalan di display 14 - MuMu memberi tiap tab display virtual sendiri.
+    // Window-nya ADA dan tidak error sama sekali; ia cuma tergambar di layar yang tidak
+    // dilihat siapa pun. Ini masalah yang sama dengan refreshGameDisplay() pada capture
+    // ("id display game tidak boleh diasumsikan 0"), tapi di sisi PENEMPATAN window.
+    //
+    // Diambil belakangan karena id display game belum diketahui saat service tersambung -
+    // baru terisi sesudah refreshGameDisplay() berjalan.
+    private val overlayContext: () -> Context = { context }
 ) {
     private val TAG = "DebugOverlay"
     private val PREFS_NAME = "roxgarden_regions"
@@ -77,13 +87,141 @@ class DebugOverlayManager(
     var isShowing = false
         private set
 
+    // ---- MODE WATCH -------------------------------------------------------------------
+    // Mode kalibrasi (show()) MENJEDA loop bot: region digeser pakai jari, dan bot yang
+    // jalan sambil layarnya disentuh hanya bikin kacau. Mode watch kebalikannya — hanya
+    // MENONTON: kotak region digambar sementara bot bekerja, tanpa handle dan tanpa
+    // menerima sentuhan sama sekali (FLAG_NOT_TOUCHABLE), supaya gesture bot tetap tembus
+    // ke game.
+    private var watchView: WatchOverlayView? = null
+    @Volatile var isWatching = false; private set
+
+    // Region tambahan yang didaftarkan fitur lain saat runtime (mis. Daily Mission).
+    // Sengaja lewat pendaftaran, bukan ditulis mati di daftar `regions` di atas: fitur
+    // yang bisa dibuang tidak boleh meninggalkan jejak di file ini.
+    private val extraRegions = mutableListOf<Region>()
+
+    fun registerRegions(list: List<Region>) {
+        val ids = list.map { it.id }.toSet()
+        extraRegions.removeAll { it.id in ids }
+        extraRegions.addAll(list)
+        watchView?.postInvalidate()
+        Log.d(TAG, "region watch didaftarkan: ${list.joinToString { it.id }}")
+    }
+
+    // ---- REGION AKTIF ------------------------------------------------------------------
+    // Menggambar semua region sekaligus tidak terbaca: 15 kotak saling tumpang tindih dan
+    // yang PENTING justru tenggelam. Yang berguna hanya satu pertanyaan: bot sedang mencari
+    // di mana SEKARANG. Jadi region hanya tampil selama ia baru saja dipakai.
+    //
+    // ACTIVE_MS 1500: pencarian template ~30ms, terlalu cepat untuk dilihat mata. Kotaknya
+    // sengaja dibiarkan tinggal sebentar supaya terbaca sebagai langkah, bukan berkedip.
+    private val activeUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val ACTIVE_MS = 1500L
+
+    fun markActive(id: String) {
+        if (!isWatching) return          // mati = nol biaya
+        activeUntil[id] = System.currentTimeMillis() + ACTIVE_MS
+        watchView?.postInvalidate()
+    }
+
+    /**
+     * Tandai region lewat KOTAKNYA, bukan namanya.
+     *
+     * Pencarian template menerima rectFrac, bukan id — jadi mencocokkan balik ke region
+     * terdaftar membuat satu kait di findTemplate() mencakup semua pemanggilnya sekaligus,
+     * tanpa menyulam id ke belasan titik panggil.
+     */
+    fun markActiveRect(r: FloatArray) {
+        if (!isWatching || r.size < 4) return
+        fun near(a: Float, b: Float) = kotlin.math.abs(a - b) < 0.001f
+        (regions + extraRegions).firstOrNull {
+            near(it.x1f, r[0]) && near(it.y1f, r[1]) && near(it.x2f, r[2]) && near(it.y2f, r[3])
+        }?.let { markActive(it.id) }
+    }
+
+    private fun activeRegions(): List<Region> {
+        val now = System.currentTimeMillis()
+        return (regions + extraRegions).filter { (activeUntil[it.id] ?: 0L) > now }
+    }
+
+    fun toggleWatch() { if (isWatching) hideWatch() else showWatch() }
+
+    fun showWatch() {
+        if (isWatching) return
+        val ctx = overlayContext()
+        val dm = ctx.resources.displayMetrics
+        val view = WatchOverlayView(ctx, { activeRegions() }, dm.widthPixels, dm.heightPixels)
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        val wm = ctx.getSystemService(WindowManager::class.java)
+        try {
+            wm.addView(view, params)
+        } catch (t: Throwable) {
+            Log.w(TAG, "WATCH overlay gagal tampil: ${t.message}")
+            return
+        }
+        watchWm = wm
+        watchView = view
+        isWatching = true
+        Log.d(TAG, "WATCH overlay ON di display ${ctx.display?.displayId} " +
+            "(${dm.widthPixels}x${dm.heightPixels}), ${(regions + extraRegions).size} region")
+    }
+
+    fun hideWatch() {
+        watchView?.let { v -> runCatching { (watchWm ?: context.getSystemService(WindowManager::class.java)).removeView(v) } }
+        watchWm = null
+        watchView = null
+        isWatching = false
+        Log.d(TAG, "WATCH overlay OFF")
+    }
+
+    /**
+     * Sembunyikan overlay selama capture, lalu tampilkan lagi.
+     *
+     * WAJIB, bukan kehati-hatian berlebihan: bot memotret layarnya SENDIRI, dan kotak-kotak
+     * ini digambar tepat di atas area yang dianalisis. Template matching di sini SSD
+     * piksel-per-piksel di ruang kanonik 720p, jadi satu garis hijau di atas ikon bukan
+     * membuat match meleset sedikit tapi GAGAL TOTAL. Menghitamkannya seperti maskHud()
+     * tidak menolong, karena yang terhapus justru piksel yang mau dibaca.
+     *
+     * Ongkosnya ~40ms per capture DAN HANYA SAAT MODE WATCH MENYALA. Kalau mati, biaya
+     * seluruh mekanisme ini nol.
+     */
+    fun suppressForCapture(): Boolean {
+        val v = watchView ?: return false
+        val latch = java.util.concurrent.CountDownLatch(1)
+        v.post { v.visibility = View.INVISIBLE; v.post { latch.countDown() } }
+        latch.await(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+        // Satu post belum menjamin frame lama sudah lepas dari komposisi layar; dua frame
+        // (~33ms @60fps) adalah jeda terkecil yang terbukti bersih di device.
+        try { Thread.sleep(35) } catch (_: InterruptedException) {}
+        return true
+    }
+
+    fun restoreAfterCapture() {
+        val v = watchView ?: return
+        v.post { v.visibility = View.VISIBLE }
+    }
+
     fun toggle() { if (isShowing) hide() else show() }
+
+    private var showWm: WindowManager? = null
+    private var watchWm: WindowManager? = null
 
     fun show() {
         if (isShowing) return
-        val dm = context.resources.displayMetrics
+        val ctx = overlayContext()
+        val dm = ctx.resources.displayMetrics
         val view = RegionOverlayView(
-            context, regions, dm.widthPixels, dm.heightPixels,
+            ctx, regions, dm.widthPixels, dm.heightPixels,
             onRegionReleased = { r -> savePrefs(r) },
             onHidePressed = { hide() }
         )
@@ -95,14 +233,17 @@ class DebugOverlayManager(
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
-        windowManager.addView(view, params)
+        val wm = ctx.getSystemService(WindowManager::class.java)
+        wm.addView(view, params)
+        showWm = wm
         overlayView = view
         isShowing = true
         Log.d(TAG, "Debug overlay ON — loop dijeda, koordinat auto-save")
     }
 
     fun hide() {
-        overlayView?.let { runCatching { windowManager.removeView(it) } }
+        overlayView?.let { v -> runCatching { (showWm ?: context.getSystemService(WindowManager::class.java)).removeView(v) } }
+        showWm = null
         overlayView = null
         isShowing = false
         Log.d(TAG, "Debug overlay OFF — loop lanjut")
@@ -297,4 +438,60 @@ private class RegionOverlayView(
     }
 
     private fun pct(f: Float) = (f * 100).toInt()
+}
+
+// ---------------------------------------------------------------------------------------
+// View WATCH: hanya menggambar. Tidak ada handle, tidak ada sentuhan, tidak ada state.
+// Sengaja kelas terpisah dari RegionOverlayView: logika drag di sana sudah terbukti jalan
+// untuk kalibrasi, dan menambah percabangan mode ke dalamnya hanya menaruh risiko di kode
+// yang tidak sedang bermasalah.
+// ---------------------------------------------------------------------------------------
+private class WatchOverlayView(
+    context: Context,
+    private val supply: () -> List<DebugOverlayManager.Region>,
+    private var screenW: Int,
+    private var screenH: Int
+) : View(context) {
+
+    private val borderP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 2f
+    }
+    private val labelP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 20f; isFakeBoldText = true
+    }
+    private val labelBgP = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(170, 0, 0, 0); style = Paint.Style.FILL
+    }
+    // Isian tipis: dengan hanya satu-dua kotak tampil, area yang sedang dibaca bot jadi
+    // terbaca sekilas tanpa harus menelusuri garisnya.
+    private val fillP = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (w > 0 && h > 0) { screenW = w; screenH = h }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val shown = supply()
+        for (r in shown) {
+            val x1 = r.x1f * screenW; val y1 = r.y1f * screenH
+            val x2 = r.x2f * screenW; val y2 = r.y2f * screenH
+            fillP.color = Color.argb(48, Color.red(r.color), Color.green(r.color), Color.blue(r.color))
+            canvas.drawRect(x1, y1, x2, y2, fillP)
+            borderP.color = r.color
+            canvas.drawRect(x1, y1, x2, y2, borderP)
+
+            // Label diberi alas gelap: kotak-kotak ini melayang di atas adegan 3D yang
+            // terang-gelapnya berubah terus, dan teks tanpa alas hilang di separuh map.
+            val tw = labelP.measureText(r.label)
+            val ty = if (y1 > 26f) y1 - 6f else y2 + 20f
+            canvas.drawRect(x1, ty - 18f, x1 + tw + 8f, ty + 5f, labelBgP)
+            labelP.color = r.color
+            canvas.drawText(r.label, x1 + 4, ty, labelP)
+        }
+        // Kotak kedaluwarsa tidak akan hilang sendiri tanpa gambar ulang: tidak ada yang
+        // memicu invalidate saat waktunya habis. Selama masih ada yang tampil, jadwalkan.
+        if (shown.isNotEmpty()) postInvalidateDelayed(250)
+    }
 }

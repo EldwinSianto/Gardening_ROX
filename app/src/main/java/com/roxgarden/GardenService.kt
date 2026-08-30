@@ -74,6 +74,32 @@ class GardenService : AccessibilityService() {
     // Capture & gesture diarahkan ke display tempat game berada — urutan buka tab jadi tak penting.
     private val GAME_PACKAGE = "com.play.rosea"
     @Volatile private var gameDisplayId = 0
+
+    /**
+     * Context yang terikat ke DISPLAY GAME, untuk menaruh overlay (HUD, kotak region).
+     *
+     * Tanpa ini overlay mendarat di display 0 sementara game jalan di display lain (terukur:
+     * 14 di MuMu multi-tab). Tidak ada error, tidak ada log gagal - window-nya benar-benar
+     * ada, hanya di layar yang tidak dilihat siapa pun. Persis alasan refreshGameDisplay()
+     * ada di sisi capture: id display game TIDAK BOLEH diasumsikan 0.
+     *
+     * Kalau display game belum diketahui atau tidak bisa diambil, jatuh balik ke context
+     * service - overlay tetap muncul di suatu tempat, tidak hilang diam-diam.
+     */
+    private fun overlayContextForGameDisplay(): android.content.Context {
+        refreshGameDisplay()
+        if (gameDisplayId == 0) return this
+        return try {
+            val dm = getSystemService(DISPLAY_SERVICE) as android.hardware.display.DisplayManager
+            val d = dm.getDisplay(gameDisplayId)
+            if (d == null) this else createDisplayContext(d).also {
+                Log.d(TAG, "overlay dipasang di display game $gameDisplayId")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "createDisplayContext($gameDisplayId) gagal: ${t.message}")
+            this
+        }
+    }
     private val screenshotExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     /** Cari display yang menampilkan game. Perlu flagRetrieveInteractiveWindows. */
@@ -439,7 +465,8 @@ class GardenService : AccessibilityService() {
             checkCaptcha = { shot -> interceptCaptcha(shot) },
             isCaptchaActive = { isHandlingCaptcha },
             closePanels = { cityNavigator.closePanels() },
-            markActivity = { markGardenActivity() }
+            markActivity = { markGardenActivity() },
+            markRegion = { r -> debugOverlay?.markActiveRect(r) }
         )
     }
 
@@ -629,10 +656,34 @@ class GardenService : AccessibilityService() {
      * Lantai 60%: EMA yang melonjak (host emulator ngadat) tidak boleh mengkerutkan jeda sampai
      * pickup belum selesai.
      */
+    // JEDA PICKUP ADAPTIF (permintaan user: "banyak jeda terbuang karena gardening delay").
+    //
+    // DELAY_AFTER_GATHER sekarang cuma PLAFON dan titik mulai, bukan nilai tetap. Nilai
+    // sebenarnya dicari sendiri: tiap kali tap sesudah jeda ini BERHASIL, jedanya dipangkas
+    // sedikit; tiap kali GAGAL, dinaikkan lebih banyak. Ia akan mengendap tepat di atas
+    // batas aslinya dan bergoyang ~100ms di sekitarnya.
+    //
+    // Naik lebih besar daripada turun (300 vs 100) DISENGAJA: ongkos kedua arah tidak sama.
+    // Terlalu lambat cuma membuang ~100ms; terlalu cepat membuang satu putaran penuh
+    // (tap gagal + capture verifikasi + jadwal ulang 200ms), jadi mundurnya harus tegas.
+    //
+    // Batas ini beda tiap device dan bisa jadi beda tiap tanaman — itulah kenapa dicari
+    // sendiri alih-alih ditebak sekali lalu ditulis mati seperti sebelumnya.
+    @Volatile private var pickupLearned = DELAY_AFTER_GATHER
+    private val PICKUP_FLOOR_MS = 150L
+    private val PICKUP_SHAVE_MS = 100L
+    private val PICKUP_BACKOFF_MS = 300L
+
+    // Sampai kapan tap berikutnya dianggap PERCOBAAN pickup. Pakai tenggat, bukan boolean:
+    // kalau siklus berikutnya ternyata tidak jadi men-tap (mis. OCR membaca maturity),
+    // boolean akan tertinggal menyala dan no-op maturity yang asli salah dituduh sebagai
+    // percobaan pickup. Tenggat kedaluwarsa sendiri.
+    @Volatile private var pickupProbeUntil = 0L
+
     private fun pickupDelay(): Long {
         val cap = perf.ema(PerfStats.CAP)
-        if (cap <= 0L) return DELAY_AFTER_GATHER
-        return (DELAY_AFTER_GATHER - cap).coerceAtLeast((DELAY_AFTER_GATHER * 0.6).toLong())
+        if (cap <= 0L) return pickupLearned
+        return (pickupLearned - cap).coerceAtLeast(PICKUP_FLOOR_MS)
     }
     private val NUMPAD_TEMPLATE_THRESHOLD = 2500.0 // avgSAD max untuk template match valid
 
@@ -723,8 +774,23 @@ class GardenService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         Log.d(TAG, "GardenService connected")
-        debugOverlay = DebugOverlayManager(this, getSystemService(WINDOW_SERVICE) as android.view.WindowManager)
-        botHud = BotHud(this, getSystemService(WINDOW_SERVICE) as android.view.WindowManager)
+        debugOverlay = DebugOverlayManager(this) { overlayContextForGameDisplay() }
+        // ── DAILY MISSION (removable): daftarkan region fitur ini ke overlay debug ──
+        debugOverlay?.registerRegions(
+            dailyMissionRunner.debugRegions().mapIndexed { i, (id, label, r) ->
+                // Warna dipisah per region supaya kotak yang bertumpang tindih (Fly Wing dan
+                // tombol interaksi hanya beda ~20px) masih bisa dibedakan sekilas.
+                val palette = intArrayOf(
+                    Color.argb(220, 255, 90, 90), Color.argb(220, 90, 200, 255),
+                    Color.argb(220, 120, 255, 120), Color.argb(220, 255, 220, 80),
+                    Color.argb(220, 255, 130, 255), Color.argb(220, 130, 255, 230),
+                    Color.argb(220, 255, 170, 60)
+                )
+                DebugOverlayManager.Region(id, label, palette[i % palette.size],
+                    r[0], r[1], r[2], r[3])
+            }
+        )
+        botHud = BotHud(this) { overlayContextForGameDisplay() }
         initOcr()
         // Service connect tapi bot tidak running = habis boot emulator / reinstall / proses mati.
         // Loop & MediaProjection tak bisa auto-resume → beri tahu user (delay 15s: kalau user
@@ -839,6 +905,10 @@ class GardenService : AccessibilityService() {
                 debugOverlay?.toggle()
                 Log.d(TAG, "Debug overlay: ${if (debugOverlay?.isShowing == true) "ON" else "OFF"}")
             }
+            "WATCH" -> {
+                debugOverlay?.toggleWatch()
+                Log.d(TAG, "Watch overlay: ${if (debugOverlay?.isWatching == true) "ON" else "OFF"}")
+            }
             "HUD" -> botHud?.toggle()
             "DEBUG_LOG" -> debugOverlay?.logAll()
         }
@@ -867,8 +937,34 @@ class GardenService : AccessibilityService() {
         // MULTI-PLANT: muat pilihan tanaman & turunkan kota yang perlu di-scan
         reloadPlantSelection()
 
-        Log.d(TAG, "Starting garden loop")
-        handler.postDelayed(gardenLoop, 2000)
+        // ── DAILY MISSION: cek otomatis saat START (permintaan user) ──────────
+        // Bot memeriksa sendiri centang di ikon Mission Board, jadi tidak ada tombol manual
+        // yang harus diingat — penting karena target sebenarnya cloud phone tanpa adb.
+        //
+        // Dijalankan SEBELUM garden loop, dan startDailyMission() sendiri yang memegang
+        // kontrak pause/resume: begitu misi selesai ia mengembalikan gardenPaused=false,
+        // menavigasikan karakter balik ke kebun, lalu menjadwalkan gardenLoop. Jadi cabang
+        // "belum selesai" TIDAK memposting loop di sini — kalau keduanya memposting, akan
+        // ada dua rantai loop berjalan bersamaan.
+        scope.launch {
+            val done = try {
+                dailyMissionRunner.dailyMissionsDone()
+            } catch (t: Throwable) {
+                Log.w(TAG, "cek daily gagal: ${t.message} — lanjut gardening")
+                true
+            }
+            if (done) {
+                Log.d(TAG, "Daily sudah selesai → langsung gardening")
+                handler.post {
+                    Log.d(TAG, "Starting garden loop")
+                    handler.postDelayed(gardenLoop, 2000)
+                }
+            } else {
+                Log.d(TAG, "Daily belum selesai → jalankan daily mission dulu")
+                hud("🎯 daily belum selesai, kerjakan dulu")
+                handler.post { startDailyMission(10) }
+            }
+        }
     }
 
     // ── MULTI-PLANT helpers ────────────────────────────────────────────────
@@ -1122,7 +1218,7 @@ class GardenService : AccessibilityService() {
             sb.appendLine("Shell root persisten: ${if (rootShell != null) "AKTIF" else "tidak (pakai fork per-capture)"}")
             sb.appendLine("Timing per langkah:")
             sb.appendLine(perf.report())
-            sb.appendLine("  jeda pickup efektif=${pickupDelay()}ms (konstanta ${DELAY_AFTER_GATHER}ms)")
+            sb.appendLine("  jeda pickup efektif=${pickupDelay()}ms (belajar ${pickupLearned}ms, plafon ${DELAY_AFTER_GATHER}ms)")
             val audit = perf.countersReport()
             if (audit.isNotEmpty()) {
                 sb.appendLine("Audit template vs OCR (fast-path):")
@@ -1157,7 +1253,16 @@ class GardenService : AccessibilityService() {
      */
     private val captureLock = Any()
 
-    private fun captureScreenRaw(): Bitmap? = synchronized(captureLock) { captureScreenLocked() }
+    private fun captureScreenRaw(): Bitmap? = synchronized(captureLock) {
+        // Overlay WATCH menggambar kotak tepat di atas area yang dianalisis, dan bot
+        // memotret layarnya sendiri — jadi overlay harus lepas dari layar dulu. Tanpa ini
+        // alat debugnya sendiri yang membuat bot gagal, dan hasil pengamatannya berbohong.
+        // Saat mode watch mati, cabang ini tidak berbiaya apa pun.
+        val ov = debugOverlay
+        if (ov?.isWatching != true) return@synchronized captureScreenLocked()
+        ov.suppressForCapture()
+        try { captureScreenLocked() } finally { ov.restoreAfterCapture() }
+    }
 
     private fun captureScreenLocked(): Bitmap? {
         // 0. PRIMER: root screencap physical display game (satu-satunya yang andal di MuMu multi-tab).
@@ -1489,9 +1594,47 @@ class GardenService : AccessibilityService() {
                                 hud("👁 transisi, cek cepat...")
                                 handler.postDelayed(loop, 1200)
                             } else {
-                                Log.d(TAG, "Tidak ada teks dikenali, retry")
-                                hud("👁 layar tak terbaca, ulang")
-                                handler.postDelayed(loop, DELAY_LOOP)
+                                // PENYELAMAT TEMPLATE. OCR gagal MENGKLASIFIKASI, tapi itu
+                                // sama sekali bukan bukti tombolnya tidak ada.
+                                //
+                                // Terukur di device (21:20-21:33): panel menu kanan terbuka
+                                // menindih area teks, OCR membaca 'Pack Battle Reward
+                                // Collection...' di SETIAP siklus dan tak pernah bisa
+                                // menyimpulkan apa pun — padahal orb-nya terlihat jelas dan
+                                // petaknya siap panen. Selama 10 menit bot tetap jalan, karena
+                                // rantai panen memasang expectReadyNext dan fast-path yang
+                                // memakai orb. Satu captcha memutus rantai itu, dan sesudahnya
+                                // SATU-SATUNYA jalan kembali adalah OCR — yang di layar ini
+                                // buta permanen. Hasilnya diam 3 menit tanpa satu pun findOrb()
+                                // dipanggil.
+                                //
+                                // Jadi cabang ini bukan optimasi, melainkan pemulihan: begitu
+                                // OCR menyerah, template (~24ms) jadi pendapat kedua. Tanpa
+                                // ini, kebutaan OCR bersifat menyerap — sekali masuk, tidak
+                                // ada yang mengeluarkan.
+                                Log.d(TAG, "Tidak ada teks dikenali → coba template orb (penyelamat)")
+                                hud("\ud83d\udc41 teks buntu \u2192 cek orb")
+                                if (!shouldGardenNow() || System.currentTimeMillis() < tapHoldUntil) {
+                                    // Di luar window, atau tap sedang ditahan karena maturity:
+                                    // jangan dipaksa. Penyelamat ini melawan KEBUTAAN, bukan
+                                    // melawan penilaian yang sudah benar.
+                                    handler.postDelayed(loop, DELAY_LOOP)
+                                } else scope.launch {
+                                    val s2 = captureScreen()
+                                    val pos = if (s2 == null) null else
+                                        withContext(Dispatchers.Default) { findOrb(s2) }
+                                    if (pos != null) {
+                                        Log.d(TAG, "penyelamat: orb terlihat walau OCR buntu → tap (${pos.first.toInt()},${pos.second.toInt()})")
+                                        hud("\u270b orb terlihat (OCR buntu) → tap")
+                                        s2?.recycle()
+                                        markGardenTap()
+                                        performTap(pos.first, pos.second)
+                                        scheduleAfterTap(loop)
+                                    } else {
+                                        s2?.recycle()
+                                        handler.post { handler.postDelayed(loop, DELAY_LOOP) }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1563,6 +1706,7 @@ class GardenService : AccessibilityService() {
     }
 
     private fun regionPx(id: String, bitmap: Bitmap): IntArray? {
+        debugOverlay?.markActive(id)
         val r = debugOverlay?.getRegion(id) ?: return null
         val x1 = (bitmap.width  * r.x1f.coerceIn(0f, 1f)).toInt()
         val y1 = (bitmap.height * r.y1f.coerceIn(0f, 1f)).toInt()
@@ -2228,7 +2372,17 @@ class GardenService : AccessibilityService() {
             if (!gone) {
                 // Tap tidak memicu gather (tombol TETAP ADA). Streak dihitung hanya kalau frame
                 // benar-benar terverifikasi — capture gagal (shot null) ≠ tombol tak bereaksi.
-                if (shot != null) {
+                val probing = System.currentTimeMillis() < pickupProbeUntil
+                pickupProbeUntil = 0L
+                if (shot != null && probing) {
+                    // Tap ini SENGAJA lebih awal dari jeda yang sudah terbukti aman, jadi
+                    // no-op di sini adalah hasil percobaan — BUKAN sinyal maturity.
+                    // Menghitungnya sebagai streak akan membuat bot menahan tap 15 detik
+                    // justru karena ia mencoba lebih cepat: makin agresif, makin lambat.
+                    pickupLearned = (pickupLearned + PICKUP_BACKOFF_MS).coerceAtMost(DELAY_AFTER_GATHER)
+                    Log.d(TAG, "pickup kecepatan -> naikkan jeda ke ${pickupLearned}ms")
+                    hud("\u23F1 pickup naik \u2192 ${pickupLearned}ms")
+                } else if (shot != null) {
                     noopTapStreak++
                     if (noopTapStreak >= NOOP_TAP_THRESHOLD) {
                         tapHoldUntil = System.currentTimeMillis() + TAP_HOLD_MS
@@ -2243,6 +2397,12 @@ class GardenService : AccessibilityService() {
             // Tap TERBUKTI bekerja → tombol memang siap; sinyal no-op sebelumnya kadaluarsa.
             noopTapStreak = 0
             tapHoldUntil = 0L
+            if (System.currentTimeMillis() < pickupProbeUntil &&
+                pickupLearned > PICKUP_FLOOR_MS) {
+                pickupLearned = (pickupLearned - PICKUP_SHAVE_MS).coerceAtLeast(PICKUP_FLOOR_MS)
+                Log.d(TAG, "pickup ${pickupLearned + PICKUP_SHAVE_MS}ms berhasil -> coba ${pickupLearned}ms")
+            }
+            pickupProbeUntil = 0L
             hud("🌾 gathering (tombol hilang)")
             Log.d(TAG, "verifikasi tap: tombol hilang → lacak sampai muncul lagi")
             markGardenActivity()
@@ -2313,13 +2473,17 @@ class GardenService : AccessibilityService() {
                 if (castMs in 500L..15_000L) perf.record(PerfStats.CAST, castMs)
                 val pickup = pickupDelay()
                 Log.d(TAG, "cast ${castMs}ms (${if (occludedByBanner) "via banner" else "via orb"})" +
-                    " → pickup ${pickup}ms (konstanta ${DELAY_AFTER_GATHER}ms)")
+                    " → pickup ${pickup}ms (belajar ${pickupLearned}ms, plafon ${DELAY_AFTER_GATHER}ms)")
                 // Penanda 📦 vs ✅ sengaja dibedakan: dari HUD langsung terlihat seberapa sering
                 // orb benar-benar tertutup banner, tanpa perlu adb.
                 hud(if (occludedByBanner) "📦 banner panen ${castMs / 1000.0}s → pickup ${pickup / 1000.0}s"
                     else "✅ cast ${castMs / 1000.0}s → pickup ${pickup / 1000.0}s")
                 markGardenActivity()
                 expectReadyNext = true
+                // Tap berikutnya adalah PERCOBAAN jeda ini. 3 detik cukup longgar untuk
+                // menampung jeda + capture + tap, tapi tetap kedaluwarsa kalau siklus
+                // berikutnya ternyata tidak jadi men-tap.
+                pickupProbeUntil = System.currentTimeMillis() + pickup + 3000
                 handler.post { handler.postDelayed(loop, pickup) }
             } else {
                 Log.w(TAG, "tombol tak muncul lagi setelah 15s — mungkin popup/captcha → jalur OCR")

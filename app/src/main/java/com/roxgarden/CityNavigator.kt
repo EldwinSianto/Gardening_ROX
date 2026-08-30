@@ -65,7 +65,18 @@ class CityNavigator(
             "mission progress", "quests refresh", "complete immediately",
             // region view (tap minimap) DAN world map (grid kota) — teksnya beda, daftarkan keduanya
             "map info", "monsters on current map", "quests on current map", "lifeskill area",
-            "affiliated areas", "defending guild"
+            "affiliated areas", "defending guild",
+            // PANEL LIFE SKILLS (buku besar: Fishing/Mining/Gardening/Cooking/Smelting/...).
+            // Inilah panel yang membuat bot nyangkut pada 20:50-20:56: navigasi berhenti di
+            // tengah jalan sesudah membuka Life, panelnya tertinggal, dan garden loop buta.
+            //
+            // WAJIB terdaftar di SINI, dan bukan cuma soal kelengkapan: panel ini menampilkan
+            // kartu skill berjudul "Gardening", sedangkan CLEAR_MARKERS berisi "gardening".
+            // Tanpa penanda ini, urutan pemeriksaan akan menyimpulkan panel Life sebagai
+            // layar BERSIH - yaitu kebalikan dari kenyataannya - dan closePanels() tidak
+            // akan pernah menekan Back. PANEL_MARKERS diperiksa SEBELUM CLEAR_MARKERS,
+            // jadi penanda di bawah ini yang memenangkan pertandingan itu.
+            "life skills in games", "upgrade function", "smelting", "crafting"
         )
         // Bukti POSITIF layar game normal (HUD terlihat) → tidak perlu Back.
         private val CLEAR_MARKERS = listOf("gardening", "backpack", "quest", "world")
@@ -434,14 +445,26 @@ class CityNavigator(
         val shot = captureRetry() ?: return ScreenState.UNKNOWN
         val texts = try {
             ocr.processImage(shot, includeAllConfidenceScores = true).texts
-        } catch (_: Throwable) { emptyList() }
+        } catch (t: Throwable) {
+            // JANGAN ditelan diam-diam. OCR yang gagal dan OCR yang membaca layar kosong
+            // menghasilkan hal yang sama persis di sini (daftar kosong -> UNKNOWN -> Back
+            // ditolak -> panel tertinggal terbuka selamanya), tapi sebabnya jauh berbeda dan
+            // hanya log ini yang bisa membedakannya. Buffer crash pernah merekam crash NATIVE
+            // onnxruntime persis di jalur ini (processImage <- readScreenState <- closePanels).
+            Log.e(TAG, "OCR readScreenState GAGAL: ${t.message}")
+            emptyList()
+        }
         shot.recycle()
         val joined = texts.joinToString(" ").lowercase()
 
         if (LEAVE_MARKERS.any { it in joined }) return ScreenState.LEAVE_DIALOG
         if (PANEL_MARKERS.any { it in joined }) return ScreenState.PANEL_OPEN
         if (CLEAR_MARKERS.any { it in joined }) return ScreenState.CLEAR
-        Log.d(TAG, "status layar TIDAK JELAS (loading?) — baca: ${texts.joinToString(" | ")}")
+        if (texts.isEmpty())
+            Log.w(TAG, "status layar TIDAK JELAS dan OCR TIDAK MENGEMBALIKAN TEKS SAMA SEKALI " +
+                "- layar benar-benar polos, atau OCR gagal (lihat baris error di atas)")
+        else
+            Log.d(TAG, "status layar TIDAK JELAS (loading?) — baca: ${texts.joinToString(" | ")}")
         return ScreenState.UNKNOWN
     }
 
@@ -451,7 +474,10 @@ class CityNavigator(
         val shot = captureRetry() ?: return false
         val res = try {
             ocr.processImage(shot, includeAllConfidenceScores = true)
-        } catch (_: Throwable) { shot.recycle(); return false }
+        } catch (t: Throwable) {
+            Log.e(TAG, "OCR dialog leave GAGAL: ${t.message}")
+            shot.recycle(); return false
+        }
         shot.recycle()
         for (i in res.texts.indices) {
             if (res.texts[i].lowercase().filter { it.isLetter() } != "cancel") continue
