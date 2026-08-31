@@ -962,7 +962,11 @@ class GardenService : AccessibilityService() {
             } else {
                 Log.d(TAG, "Daily belum selesai → jalankan daily mission dulu")
                 hud("🎯 daily belum selesai, kerjakan dulu")
-                handler.post { startDailyMission(10) }
+                // Jumlahnya diambil dari hitungan papan, bukan selalu 10: sisa 4 berarti
+                // 4 penyisiran tracker, bukan 10 yang enam di antaranya pasti nihil.
+                val sisa = dailyMissionRunner.missionsRemaining()
+                Log.d(TAG, "Daily belum selesai -> kerjakan $sisa misi")
+                handler.post { startDailyMission(sisa) }
             }
         }
     }

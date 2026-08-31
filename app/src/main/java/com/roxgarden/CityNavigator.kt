@@ -76,12 +76,24 @@ class CityNavigator(
             // layar BERSIH - yaitu kebalikan dari kenyataannya - dan closePanels() tidak
             // akan pernah menekan Back. PANEL_MARKERS diperiksa SEBELUM CLEAR_MARKERS,
             // jadi penanda di bawah ini yang memenangkan pertandingan itu.
-            "life skills in games", "upgrade function", "smelting", "crafting"
+            // HANYA frasa, JANGAN kata tunggal. Versi pertama memakai "smelting" dan
+            // "crafting" — keduanya kata sehari-hari yang wajar diketik pemain di chat, dan
+            // readScreenState() dulu membaca SELURUH layar termasuk chat. Akibatnya layar
+            // bersih dinyatakan PANEL_OPEN, Back ditekan, dan yang muncul justru dialog
+            // "Leave the game?" (terlihat di log 18:34-18:35, tiga Back lalu dialog keluar).
+            // Pita chat sekarang sudah dikecualikan di readScreenState, tapi kata tunggal
+            // tetap tidak dipakai: chat bukan satu-satunya teks liar di layar.
+            "life skills in games", "upgrade function"
         )
         // Bukti POSITIF layar game normal (HUD terlihat) → tidak perlu Back.
         private val CLEAR_MARKERS = listOf("gardening", "backpack", "quest", "world")
         // Dialog keluar game — MUNCUL kalau Back ditekan di layar polos. Wajib di-Cancel.
         private val LEAVE_MARKERS = listOf("leave the game", "leave game")
+
+        // Chat ada di dasar layar dan isinya DITULIS PEMAIN LAIN — teks apa pun bisa muncul
+        // di sana. Semua pencocokan penanda wajib mengecualikannya, kalau tidak satu pesan
+        // chat bisa mengubah kesimpulan bot tentang keadaan layarnya sendiri.
+        private const val CHAT_TOP_FRAC = 0.78f
 
         // Scroll-search encyclopedia. Swipe PELAN (durasi besar) supaya tidak fling/inersia —
         // fling melompati baris target di antara frame stabil → tanaman terlewat.
@@ -443,8 +455,15 @@ class CityNavigator(
     private suspend fun readScreenState(): ScreenState {
         val ocr = ocrProvider() ?: return ScreenState.UNKNOWN
         val shot = captureRetry() ?: return ScreenState.UNKNOWN
+        val h = shot.height.toFloat()
         val texts = try {
-            ocr.processImage(shot, includeAllConfidenceScores = true).texts
+            val r = ocr.processImage(shot, includeAllConfidenceScores = true)
+            // Buang teks di pita chat SEBELUM digabung. Ini yang membuat penanda panel
+            // hanya menilai UI game, bukan obrolan pemain lain.
+            r.texts.indices.filter { i ->
+                val b = r.boxes[i].boundingRect()
+                (b.top + b.bottom) / 2f <= h * CHAT_TOP_FRAC
+            }.map { r.texts[it] }
         } catch (t: Throwable) {
             // JANGAN ditelan diam-diam. OCR yang gagal dan OCR yang membaca layar kosong
             // menghasilkan hal yang sama persis di sini (daftar kosong -> UNKNOWN -> Back
@@ -457,9 +476,21 @@ class CityNavigator(
         shot.recycle()
         val joined = texts.joinToString(" ").lowercase()
 
-        if (LEAVE_MARKERS.any { it in joined }) return ScreenState.LEAVE_DIALOG
-        if (PANEL_MARKERS.any { it in joined }) return ScreenState.PANEL_OPEN
-        if (CLEAR_MARKERS.any { it in joined }) return ScreenState.CLEAR
+        LEAVE_MARKERS.firstOrNull { it in joined }?.let {
+            Log.d(TAG, "layar = DIALOG KELUAR (penanda '$it')")
+            return ScreenState.LEAVE_DIALOG
+        }
+        // Penanda yang cocok IKUT DI-LOG. Tanpa ini, "panel terbukti terbuka -> Back" pada
+        // layar yang sebenarnya bersih tidak bisa dilacak sampai ke kata penyebabnya, dan
+        // menebak kata mana yang salah dari belasan penanda adalah kerja buta.
+        PANEL_MARKERS.firstOrNull { it in joined }?.let {
+            Log.d(TAG, "layar = PANEL TERBUKA (penanda '$it')")
+            return ScreenState.PANEL_OPEN
+        }
+        CLEAR_MARKERS.firstOrNull { it in joined }?.let {
+            Log.d(TAG, "layar = BERSIH (penanda '$it')")
+            return ScreenState.CLEAR
+        }
         if (texts.isEmpty())
             Log.w(TAG, "status layar TIDAK JELAS dan OCR TIDAK MENGEMBALIKAN TEKS SAMA SEKALI " +
                 "- layar benar-benar polos, atau OCR gagal (lihat baris error di atas)")

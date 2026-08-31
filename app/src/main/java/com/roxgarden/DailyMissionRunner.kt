@@ -50,6 +50,13 @@ class DailyMissionRunner(
         // tidak ada kandidat lain di dalam kotak sekecil ini.
         // Carnival: toolbar kanan-atas, terukur di (858,18)..(932,68).
         private val CARNIVAL_RECT = floatArrayOf(0.60f, 0.0f, 0.80f, 0.16f)
+
+        // JARING PENGAMAN teks untuk ikon Carnival. Pita pencarian label "Carnival" yang
+        // ada TEPAT DI BAWAH ikonnya, dan jarak dari label ke titik tengah ikon.
+        // Terukur di frame kanonik: ikon (858,18)..(932,69), labelnya di y~56..69.
+        private const val CARNIVAL_TEXT_Y_MAX = 0.20f
+        private const val CARNIVAL_TEXT_X_MIN = 0.55f
+        private const val CARNIVAL_LABEL_TO_ICON_DY = 22f
         // Mission Board: di dalam panel Carnival, terukur di (610,412)..(684,484).
         private val MISSION_BOARD_RECT = floatArrayOf(0.30f, 0.42f, 0.75f, 0.85f)
 
@@ -65,7 +72,29 @@ class DailyMissionRunner(
         // bukan karena hitungan. Batas tetap sudah dua kali salah tebak: 4 scroll baru
         // sampai kategori [Favor], dan panjang daftar berbeda-beda tiap akun/hari.
         // Angka ini hanya pengaman terakhir supaya tidak pernah jadi loop tak berujung.
+        // Quest [Daily] yang PASTI bukan misi Mission Board -> jangan di-tap sama sekali.
+        // Keterangan user: "Xavier's Mysterious Item" muncul SETIAP HARI dan bukan misi papan.
+        //
+        // COCOKKAN JUDULNYA, JANGAN NAMA NPC-NYA. Versi pertama memakai "xavier" dengan
+        // alasan lebih tahan terhadap OCR yang berantakan - dan itu SALAH: koreksi user,
+        // Xavier kadang memberi daily quest yang justru penting. Menyaring lewat nama NPC
+        // ikut membuang quest-quest itu tanpa jejak.
+        //
+        // "mysterious" dipilih sebagai satu kata dari JUDULNYA: cukup khas untuk quest ini,
+        // dan satu kata utuh lebih tahan banting daripada judul lengkap (OCR mengacak tanda
+        // kutip pada "Xavier's" dan kerap membaca "Item" jadi "ltem").
+        //
+        // Arah kesalahannya sengaja dipilih. Gagal menyaring hanya berongkos satu tap dan
+        // ~1,5 detik, lalu pemeriksaan Fly Wing - yang memang wasit sebenarnya - mengambil
+        // alih. Menyaring terlalu banyak berarti misi papan yang sah TIDAK PERNAH dikerjakan
+        // dan tidak ada yang memberi tahu. Kalau ragu, JANGAN saring.
+        private val SKIP_QUEST_KEYWORDS = listOf("mysterious")
+
         private const val TRACKER_SCROLL_HARD_CAP = 40
+        // Pengaman jumlah entry yang boleh dicoba dalam satu penyisiran. Sekarang tiap tap
+        // diikuti pembacaan ulang, jadi loop bisa berputar tanpa menggulung sama sekali —
+        // batas ini yang memastikan ia tetap berakhir.
+        private const val MAX_ENTRY_TAPS = 25
         private const val D_SCROLL = 900L
 
         // Titik swipe untuk menggulung tracker. WAJIB di luar joystick analog pada KEDUA
@@ -94,12 +123,24 @@ class DailyMissionRunner(
         // jatuh utuh di dalam celah yang terlewat. Gejalanya paling jelas saat 9/10,
         // ketika tinggal satu entry [Daily] di antara belasan [Side].
         //
-        // 100px dalam 1400ms (~71px/detik) ada di bawah ambang fling, jadi daftar bergerak
-        // persis sejauh jari — dan menyisakan ~200px tumpang tindih, cukup untuk membuat
-        // tiap entry muncul di beberapa pembacaan berturut-turut.
-        private const val TRACKER_STEP_Y_FROM = 0.52f
-        private const val TRACKER_STEP_Y_TO = 0.38f
-        private const val TRACKER_STEP_MS = 1400L
+        // 200px dalam 2800ms (~72px/detik). KECEPATANNYA yang harus tetap di bawah ambang
+        // fling, bukan jaraknya — selama jari bergerak pelan, daftar berhenti persis di
+        // tempat jari berhenti berapa pun jauhnya. Jadi jarak dinaikkan 2x (permintaan
+        // user) sementara px/detik dibiarkan sama seperti sebelumnya.
+        //
+        // Yang mahal di tiap langkah BUKAN swipe-nya, melainkan readTracker() sesudahnya
+        // (capture + OCR layar penuh, terukur ~2,7 detik). Menggandakan jarak memangkas
+        // JUMLAH pembacaan itu jadi separuh; menggandakan durasi swipe hanya menambah 1,4
+        // detik. Itulah sumber percepatannya, bukan menyapu lebih cepat.
+        //
+        // Batas amannya: langkah harus tetap LEBIH KECIL dari tinggi pita baca (~300px,
+        // y 144..446), kalau tidak akan ada celah yang tidak pernah terbaca sama sekali.
+        // 200px menyisakan 100px tumpang tindih. Versi 187px yang dulu melewatkan entry
+        // gagal BUKAN karena jaraknya, tapi karena 267px/detik memicu fling: daftar
+        // meluncur lebih jauh daripada jari, dan sejauh apa tidak tetap.
+        private const val TRACKER_STEP_Y_FROM = 0.60f
+        private const val TRACKER_STEP_Y_TO = 0.32f
+        private const val TRACKER_STEP_MS = 2800L
 
         // Popup item wing muncul di tengah-kanan layar. Dipakai DUA kali: sebagai pembeda
         // (misi Mission Board vs daily lain) dan sebagai tombol yang ditekan.
@@ -244,6 +285,16 @@ class DailyMissionRunner(
         private const val WING_APPEAR_TIMEOUT_MS = 1500L
         // Batas menunggu popup tertutup sesudah Use ditekan = bukti tap kena sasaran.
         private const val WING_GONE_TIMEOUT_MS = 1200L
+
+        // Jendela poll Fly Wing SESUDAH Submit. Temuan user: begitu satu misi di-submit,
+        // game langsung menawarkan Fly Wing ke misi berikutnya.
+        //
+        // Harus berupa JENDELA, bukan satu jepretan. Popup ini terukur bisa menutup diri
+        // dalam ~150ms (SSD=258 lalu 47680 pada frame 147ms berikutnya), sedangkan waktu
+        // munculnya sesudah Submit tidak tetap. Satu jepretan pada saat yang salah akan
+        // melewatkan seluruh umurnya, dan ongkos meleset itu mahal: satu penyisiran tracker
+        // penuh yang sebenarnya tidak perlu.
+        private const val WING_AFTER_SUBMIT_MS = 3000L
     }
 
     /**
@@ -439,6 +490,46 @@ class DailyMissionRunner(
      * (CHAT_TOP_FRAC) yang isinya tidak terkendali.
      */
     /** Cari kotak teks, kembalikan titik tengahnya TANPA men-tap. null kalau tak ada. */
+    /**
+     * Satu pass OCR, dua sasaran: teks "Submit" (cocok PERSIS) atau tombol yang teksnya
+     * DIAWALI "Hand Over" (misi serah-terima item).
+     *
+     * Awalan, bukan judul penuh: nama itemnya berubah tiap misi ("Hand Over Sewage
+     * Sample", "Hand Over Hairtail", ...) — sama seperti label tombol interaksi yang juga
+     * berganti-ganti. Yang tetap hanya dua kata pertamanya.
+     *
+     * Submit diperiksa LEBIH DULU. Kalau keduanya kebetulan terbaca di frame yang sama,
+     * Submit yang menutup misi; menekan Hand Over lebih dulu hanya menunda.
+     *
+     * Pita y 0.30..0.95 mengikuti pencarian Submit yang lama, dan sengaja MELEWATI batas
+     * chat: tombol-tombol ini duduk rendah di layar (Hand Over terukur ~y 0.71), sedangkan
+     * saat dialog NPC terbuka chat tertutup panelnya.
+     */
+    private suspend fun findSubmitOrHandOver(): Pair<String, Pair<Float, Float>>? {
+        val ocr = ocrProvider() ?: return null
+        val screen = captureStable() ?: return null
+        val w = screen.width.toFloat(); val h = screen.height.toFloat()
+        val res = try {
+            ocr.processImage(screen, includeAllConfidenceScores = true)
+        } catch (t: Throwable) {
+            Log.e(TAG, "OCR submit/handover error: ${t.message}"); screen.recycle(); return null
+        }
+        screen.recycle()
+
+        var handOver: Pair<String, Pair<Float, Float>>? = null
+        for (i in res.texts.indices) {
+            val raw = res.texts[i].trim()
+            val n = norm(raw)
+            val r = res.boxes[i].boundingRect()
+            val cx = (r.left + r.right) / 2f
+            val cy = (r.top + r.bottom) / 2f
+            if (cy < h * 0.30f || cy > h * 0.95f) continue
+            if (n == "submit") return "submit" to (cx to cy)
+            if (handOver == null && n.startsWith("handover")) handOver = raw to (cx to cy)
+        }
+        return handOver
+    }
+
     private suspend fun findTextBox(
         needle: String,
         minYFrac: Float = 0f,
@@ -645,6 +736,23 @@ class DailyMissionRunner(
         }
     }
 
+    // Sudah ditekan di dalam selectMissionBoardQuest()? Menghindari tekan kedua yang
+    // percuma di loop misi.
+    @Volatile private var flyWingTapped = false
+
+    /**
+     * Tekan "Use" TANPA memoll dulu — dipakai tepat saat popup baru saja terlihat.
+     * Mengembalikan true hanya kalau popup terbukti tertutup sesudahnya.
+     */
+    private suspend fun tapFlyWingNow(): Boolean {
+        if (flyUseX <= 0f) return false
+        tap(flyUseX, flyUseY)
+        val gone = flyWingGone()
+        Log.d(TAG, "tap Use seketika (${flyUseX.toInt()},${flyUseY.toInt()}) -> " +
+            if (gone) "popup tertutup" else "popup MASIH ada")
+        return gone
+    }
+
     /** Popup sudah tertutup? Inilah bukti tap "Use" benar-benar mengenai sasaran. */
     private suspend fun flyWingGone(): Boolean {
         val start = System.currentTimeMillis()
@@ -720,6 +828,12 @@ class DailyMissionRunner(
 
     /** Isi tracker sekali baca: entry [Daily] yang terlihat + sidik teks seluruh pita. */
     private data class TrackerEntry(val x: Float, val y: Float, val text: String)
+
+    /** Entry tracker yang sudah dipastikan BUKAN misi papan (lihat SKIP_QUEST_KEYWORDS). */
+    private fun isSkippedQuest(e: TrackerEntry): Boolean {
+        val n = norm(e.text)
+        return SKIP_QUEST_KEYWORDS.any { it in n }
+    }
 
     private data class TrackerRead(
         val dailyEntries: List<TrackerEntry>,
@@ -817,43 +931,89 @@ class DailyMissionRunner(
     // tercampur: "ada misi jalan tapi tak butuh terbang" vs "tidak ada misi sama sekali".
     @Volatile private var lastScanDailySeen = 0
 
+    /**
+     * Kunci identitas entry tracker.
+     *
+     * Pakai TEKS, bukan posisi, karena posisi tidak stabil: begitu sebuah quest dipilih,
+     * entry-nya bertambah tinggi (muncul baris "Distance to target"/"Target location") dan
+     * seluruh daftar di bawahnya bergeser. Kunci berbasis posisi akan menganggap entry yang
+     * bergeser sebagai entry baru, lalu mencobanya lagi.
+     *
+     * Kalau OCR memecah entri sampai teksnya tinggal "[Daily]" saja, teks itu tidak cukup
+     * membedakan satu entry dari yang lain — di situ barulah posisi dipakai, dan kunci
+     * posisi sengaja dibuang tiap kali daftar digulung.
+     */
+    private fun entryKeyText(e: TrackerEntry): String? {
+        val n = norm(e.text)
+        return if (n.length > 5) n else null
+    }
+
     private suspend fun selectMissionBoardQuest(): Boolean {
         lastScanDailySeen = 0
+        flyWingTapped = false
         scrollTrackerToTop()
-        val tried = mutableSetOf<Int>()   // entry yang sudah dicoba, dikunci per posisi y (10px)
+        // Dua daftar "sudah dicoba" dengan umur berbeda, sesuai keandalan kuncinya:
+        // teks bertahan sepanjang penyisiran, posisi hanya sampai gulungan berikutnya.
+        val triedText = mutableSetOf<String>()
+        val triedPos = mutableSetOf<Int>()
         var prevFp = ""
         var scroll = 0
-        while (scroll < TRACKER_SCROLL_HARD_CAP) {
+        var taps = 0
+        while (scroll < TRACKER_SCROLL_HARD_CAP && taps < MAX_ENTRY_TAPS) {
             val t = readTracker()
             lastScanDailySeen += t.dailyEntries.size
             Log.d(TAG, "tracker: ${t.dailyEntries.size} entry [Daily] terlihat (scroll $scroll) " +
                 "| baca: ${t.rawTexts.joinToString(" | ")}")
-            for ((idx, e) in t.dailyEntries.withIndex()) {
-                // Setelah scroll, entry yang sama bisa muncul lagi di posisi berbeda; kunci
-                // kasar per-10px sudah cukup untuk tidak mencoba entry yang persis sama dua kali
-                // berturut-turut tanpa scroll di antaranya.
-                val key = (e.y / 10f).toInt()
-                if (!tried.add(key)) continue
-                Log.d(TAG, "coba entry [Daily] #${idx + 1} '${e.text}' di (${e.x.toInt()},${e.y.toInt()})")
-                tap(e.x, e.y)
-                // Jeda buta D_SETTLE + OCR diganti poll template. Entry yang BENAR terjawab
-                // dalam ~200ms alih-alih ~3 detik; entry yang SALAH pun lebih cepat
-                // ditinggalkan karena tak ada lagi OCR layar penuh yang harus dibayar.
-                if (awaitFlyWing()) {
-                    Log.d(TAG, "Fly Wing muncul -> entry ini misi Mission Board")
-                    return true
+
+            // SATU tap per pembacaan, lalu BACA ULANG.
+            //
+            // Versi sebelumnya men-tap semua entry dari SATU pembacaan berturut-turut. Itu
+            // sumber ketidaksinkronan yang dilaporkan user: men-tap entry pertama MENGUBAH
+            // tata letak daftar (entry terpilih jadi lebih tinggi karena menampilkan jarak
+            // ke sasaran), sehingga koordinat entry kedua — yang diambil dari pembacaan
+            // SEBELUM tap itu — sudah menunjuk baris yang salah. Tap berikutnya mendarat di
+            // quest lain, atau di celah antar-entry.
+            //
+            // Ongkosnya satu OCR tambahan per kandidat. Itu dibayar demi menghapus seluruh
+            // kelas kesalahan "menekan baris yang salah", yang gagalnya diam-diam: bot tetap
+            // terlihat bekerja sambil memilih quest yang keliru.
+            var target: TrackerEntry? = null
+            for (e in t.dailyEntries) {
+                val tk = entryKeyText(e)
+                val fresh = if (tk != null) triedText.add(tk) else triedPos.add((e.y / 10f).toInt())
+                if (!fresh) continue
+                if (isSkippedQuest(e)) {
+                    Log.d(TAG, "entry [Daily] '${e.text}' ada di daftar lewati -> tidak di-tap")
+                    continue
                 }
-                Log.d(TAG, "Fly Wing tidak muncul -> bukan misi papan, lanjut entry berikutnya")
+                target = e; break
             }
 
-            // Daftar sudah mentok? Sidik teks pita tracker TIDAK BERUBAH setelah scroll = tidak
-            // ada lagi yang bisa digulung. Ini yang menghentikan loop, bukan hitungan.
+            if (target != null) {
+                taps++
+                Log.d(TAG, "coba entry [Daily] '${target.text}' di (${target.x.toInt()},${target.y.toInt()})")
+                tap(target.x, target.y)
+                if (awaitFlyWing()) {
+                    Log.d(TAG, "Fly Wing muncul -> entry ini misi Mission Board")
+                    // TEKAN SEKETIKA, di detik yang sama popup terlihat. Popup ini terukur
+                    // bisa menutup diri dalam ~150ms (SSD=258 lalu 47680 pada frame 147ms
+                    // berikutnya): men-tap entry quest memicu auto-path, dan begitu pathing
+                    // jalan game menarik kembali tawaran transportnya. Memoll ulang dulu
+                    // sebelum menekan justru yang menciptakan kegagalannya.
+                    flyWingTapped = tapFlyWingNow()
+                    return true
+                }
+                Log.d(TAG, "Fly Wing tidak muncul -> bukan misi papan, baca ulang tracker")
+                continue   // JANGAN scroll: masih mungkin ada kandidat lain di layar ini
+            }
+
+            // Tidak ada kandidat baru di posisi ini -> barulah menggulung.
             if (t.fingerprint.isNotEmpty() && t.fingerprint == prevFp) {
                 Log.d(TAG, "isi tracker tidak berubah setelah scroll -> sudah mentok di bawah")
                 break
             }
             prevFp = t.fingerprint
-            tried.clear()   // posisi bergeser setelah scroll, kunci lama tidak berlaku lagi
+            triedPos.clear()   // kunci posisi tidak berlaku lagi sesudah daftar bergeser
 
             scroll++
             Log.d(TAG, "belum ketemu misi Mission Board, scroll tracker $scroll")
@@ -861,6 +1021,8 @@ class DailyMissionRunner(
                       TRACKER_SWIPE_X, TRACKER_STEP_Y_TO, TRACKER_STEP_MS)
             delay(D_SCROLL)
         }
+        if (taps >= MAX_ENTRY_TAPS)
+            Log.w(TAG, "berhenti di pengaman $MAX_ENTRY_TAPS tap entry")
         if (scroll >= TRACKER_SCROLL_HARD_CAP)
             Log.w(TAG, "berhenti di pengaman $TRACKER_SCROLL_HARD_CAP scroll")
         Log.w(TAG, "tidak ada entry [Daily] yang memunculkan wing")
@@ -875,8 +1037,20 @@ class DailyMissionRunner(
     // Pelacak label interaksi — direset tiap misi, dipakai pengaman anti-tekan-berulang.
     private var interactRepeats = 0
 
+    // Pengaman tombol Hand Over. Misi serah-terima butuh DUA tekan yang sah: tombol hijau
+    // di dekat NPC membuka panel "Submit Item", lalu tombol biru di dalam panel itu yang
+    // benar-benar menyerahkan. Jadi batasnya tidak boleh 1 atau 2.
+    //
+    // Batas ini ada karena satu jalur gagal yang berbahaya: kalau itemnya TIDAK otomatis
+    // terpilih di panel, menekan "Hand Over" tidak melakukan apa pun — dan karena tiap
+    // tekan me-reset penanda kemajuan, timer menganggur 5 menit tidak akan pernah habis.
+    // Misi macet itu akan membakar pagar keras 25 menit sambil terlihat sibuk.
+    private var handOverRepeats = 0
+    private val HANDOVER_MAX_REPEAT = 4
+
     private suspend fun waitForSubmit(missionNo: Int): Boolean {
         interactRepeats = 0
+        handOverRepeats = 0
         val start = System.currentTimeMillis()
         var lastAction = start
         var nudges = 0
@@ -980,7 +1154,9 @@ class DailyMissionRunner(
                 lastTrackerFp = t.digits
 
                 nudges++
-                val e = t.dailyEntries.firstOrNull()
+                // Nudge juga menghormati daftar lewati: memancing tujuan berikutnya lewat
+                // quest yang bukan misi papan justru menyeret karakter menjauh.
+                val e = t.dailyEntries.firstOrNull { !isSkippedQuest(it) }
                 if (e != null) {
                     Log.d(TAG, "diam ${NUDGE_AFTER_MS / 1000}s -> tap ulang quest (nudge $nudges/$NUDGE_MAX)")
                     hud("misi $missionNo: pancing tujuan berikutnya")
@@ -1008,9 +1184,39 @@ class DailyMissionRunner(
                 lastAction = System.currentTimeMillis()
             }
 
-            if (findTextBox("submit", 0.30f, 0.95f) != null) {
-                Log.d(TAG, "dialog Submit muncul (misi $missionNo, ${System.currentTimeMillis() - start}ms)")
-                return true
+            // SATU OCR menjawab DUA pertanyaan: dialog Submit sudah muncul, atau ada tombol
+            // "Hand Over ..." yang menunggu ditekan. Dipisah jadi dua pemanggilan akan
+            // membayar OCR layar penuh (~2,7 detik) DUA KALI tiap poll 2 detik — poll-nya
+            // sendiri yang akan jadi hambatan.
+            when (val hit = findSubmitOrHandOver()) {
+                null -> {}
+                else -> {
+                    if (hit.first == "submit") {
+                        Log.d(TAG, "dialog Submit muncul (misi $missionNo, ${System.currentTimeMillis() - start}ms)")
+                        return true
+                    }
+                    // MISI TIPE HAND OVER (temuan user): NPC minta item diserahkan lewat
+                    // tombol hijau berlabel "Hand Over <nama item>". Tanpa penanganan ini
+                    // bot hanya melewati cutscene lalu menunggu Submit yang tidak akan
+                    // pernah muncul, sampai timeout.
+                    handOverRepeats++
+                    if (handOverRepeats > HANDOVER_MAX_REPEAT) {
+                        // Sudah ditekan berkali-kali tanpa Submit muncul: yang terbaca ini
+                        // BUKAN tombol yang berfungsi (mungkin itemnya belum terpilih di
+                        // panel). Berhenti menekan DAN berhenti me-reset penanda kemajuan,
+                        // supaya timeout menganggur bisa menutup misi ini alih-alih bot
+                        // berputar diam-diam sampai pagar 25 menit.
+                        Log.w(TAG, "'${hit.first}' sudah ditekan ${handOverRepeats}x tanpa Submit -> berhenti menekan")
+                        hud("misi $missionNo: Hand Over tak bereaksi")
+                    } else {
+                        Log.d(TAG, "tombol '${hit.first}' -> serahkan item (${hit.second.first.toInt()},${hit.second.second.toInt()})")
+                        hud("misi $missionNo: serahkan item")
+                        tap(hit.second.first, hit.second.second)
+                        lastAction = System.currentTimeMillis()
+                        delay(D_SETTLE)
+                    }
+                    continue
+                }
             }
             val waited = (System.currentTimeMillis() - start) / 1000
             hud("misi $missionNo - menunggu ${waited}s")
@@ -1032,6 +1238,9 @@ class DailyMissionRunner(
         // Jalur "sudah di lokasi" hanya dicoba SEKALI per run: kalau ternyata memang tidak ada
         // misi berjalan, mengulanginya berarti membakar 5 menit timeout tiap putaran.
         var submitWaitedOnce = false
+        // Putaran sebelumnya berakhir dengan Submit yang berhasil? Menentukan seberapa lama
+        // Fly Wing ditunggui di awal putaran ini.
+        var justSubmitted = false
         while (done < maxMissions) {
             val no = done + 1
 
@@ -1043,9 +1252,14 @@ class DailyMissionRunner(
             // di sini adalah "popupnya ada atau tidak", dan template menjawabnya jauh lebih
             // murah. Latarnya kotak putih solid, jadi SSD-nya stabil — beda dari ikon
             // Carnival yang semi-transparan di atas adegan 3D dan nilainya bergoyang.
+            // Sesudah Submit, tunggui popupnya sebentar; di luar itu cukup satu jepretan.
+            // Membedakan keduanya penting: menunggu 3 detik di SETIAP putaran akan menambah
+            // 3 detik mati pada putaran yang memang tidak akan pernah memunculkan wing.
+            val wingWindow = if (justSubmitted) WING_AFTER_SUBMIT_MS else 0L
+            justSubmitted = false
             hud("misi $no: cek Fly Wing")
             var flying = false
-            if (tapFlyWing(0)) {
+            if (tapFlyWing(wingWindow)) {
                 Log.d(TAG, "popup Fly Wing sudah ada -> langsung terbang, lewati pencarian tracker")
                 flying = true
             }
@@ -1082,7 +1296,7 @@ class DailyMissionRunner(
                             if (tapTextButton("submit", 0.30f, 0.95f)) {
                                 done++; markActivity()
                                 Log.d(TAG, "misi $no SELESAI via jalur sudah-di-lokasi (total $done)")
-                                delay(D_NAV)
+                                justSubmitted = true
                                 continue
                             }
                         }
@@ -1090,8 +1304,27 @@ class DailyMissionRunner(
                     Log.d(TAG, "tidak ada misi Mission Board tersisa -> SELESAI ($done misi)")
                     return done
                 }
-                hud("misi $no: Fly Wing")
-                if (!tapFlyWing()) { abort("Fly Wing tak bisa ditekan, misi $no"); return done }
+                if (!flyWingTapped) {
+                    hud("misi $no: Fly Wing")
+                    // Gagal menekan Fly Wing BUKAN alasan membatalkan seluruh daily.
+                    //
+                    // Versi sebelumnya membatalkan di sini, dengan anggapan "dialognya baru
+                    // saja dipastikan ada, jadi gagal berarti benar-benar tak terduga".
+                    // Anggapan itu salah dua kali: popupnya bisa menutup diri, DAN misi yang
+                    // sasarannya di map yang sama memang tidak butuh terbang sama sekali
+                    // (terukur: "54 Jokers, Distance to target: 63 m" — karakter sudah di
+                    // Clock Tower, tinggal jalan kaki).
+                    //
+                    // Quest-nya sendiri SUDAH terpilih oleh tap sebelumnya, jadi auto-path
+                    // kemungkinan besar sudah berjalan. Melanjutkan ke waitForSubmit jauh
+                    // lebih baik: kalau memang macet, timeout menganggur yang menutupnya —
+                    // satu misi, bukan sembilan misi sisanya.
+                    if (!tapFlyWing()) {
+                        Log.w(TAG, "Fly Wing tak bisa ditekan misi $no -> lanjut tanpa terbang " +
+                            "(sasaran mungkin di map yang sama)")
+                        hud("misi $no: tanpa Fly Wing, jalan kaki")
+                    }
+                }
             }
             delay(D_TRANSPORT)
 
@@ -1103,7 +1336,11 @@ class DailyMissionRunner(
             done++
             markActivity()
             Log.d(TAG, "misi $no SELESAI (total $done)")
-            delay(D_NAV)
+            // TIDAK ADA delay(D_NAV) di sini lagi. Tawaran Fly Wing untuk misi berikutnya
+            // muncul TEPAT sesudah Submit, dan umurnya pendek — tidur buta 2 detik dulu bisa
+            // melewatinya utuh. Poll di awal putaran berikutnya yang menjadi penantiannya,
+            // dan poll itu bereaksi begitu popupnya ada, bukan sesudah waktu habis.
+            justSubmitted = true
         }
         Log.d(TAG, "batas maxMissions=$maxMissions tercapai")
         return done
@@ -1133,9 +1370,53 @@ class DailyMissionRunner(
      * jadi pengecualian chat tidak berlaku di konteks ini. Uji pertama gagal persis karena
      * pita 0.45..0.78 memotong tombolnya.
      */
+    /**
+     * Buka panel Carnival: template dulu, teks sebagai jaring pengaman.
+     *
+     * Template SENDIRIAN tidak cukup andal untuk ikon ini, dan alasannya terukur. Ikon
+     * Carnival punya DUA sumber variasi sekaligus:
+     *   1. BERANIMASI - balonnya berganti warna (template menyimpan balon merah muda,
+     *      di layar bisa biru+kuning).
+     *   2. semi-transparan di atas adegan 3D yang HIDUP - latar ikut terhitung.
+     *
+     * Terukur 30 Agustus di Payon (latar kayu terang): SSD=20035 melawan ambang 14000,
+     * tiga run berturut-turut gagal dan seluruh Daily Mission batal. Sebelumnya di Morroc
+     * (latar gurun) match yang benar menghasilkan 4717-6519. Jadi sebarannya ditentukan
+     * MAP TEMPAT KARAKTER BERDIRI, bukan oleh ikonnya.
+     *
+     * Menaikkan ambang ke >20000 bukan jawabannya: template 74x51 dengan ambang selonggar
+     * itu akan mulai cocok dengan apa saja.
+     *
+     * Peta selisih per blok antara template dan layar Payon menunjukkan jalan keluarnya:
+     * tepi kiri/kanan (latar murni) 37-73k, area balon 25-36k, tapi LABEL TEKS "Carnival"
+     * di bawah ikon hanya 0-3k. Label itu teks UI yang opak dan tidak beranimasi, jadi ia
+     * kebal terhadap kedua sumber variasi tadi.
+     *
+     * Urutannya tetap template dulu: ~30ms saat berhasil, dan OCR (~2,7 detik) hanya
+     * dibayar ketika template menyerah.
+     */
+    private suspend fun openCarnival(tries: Int): Boolean {
+        if (tapTemplate("map_icons/carnival.png", "Carnival", CARNIVAL_RECT, tries)) return true
+
+        Log.d(TAG, "template Carnival gagal -> jaring pengaman: cari teks 'Carnival'")
+        val pos = findTextBox("carnival", 0f, CARNIVAL_TEXT_Y_MAX, CARNIVAL_TEXT_X_MIN)
+        if (pos == null) {
+            Log.w(TAG, "teks 'Carnival' juga tidak ketemu -> panel menu kemungkinan tertutup")
+            return false
+        }
+        // Yang ditekan IKONNYA, bukan labelnya. Menekan label belum tentu memicu apa pun -
+        // pelajaran yang sama sudah didapat pada tombol interaksi misi, di mana label
+        // ditekan 4x berturut-turut tanpa reaksi karena tombol aslinya ada di atasnya.
+        val ty = pos.second - CARNIVAL_LABEL_TO_ICON_DY
+        Log.d(TAG, "teks 'Carnival' di (${pos.first.toInt()},${pos.second.toInt()}) -> tap ikon (${pos.first.toInt()},${ty.toInt()})")
+        hud("Carnival via teks")
+        tap(pos.first, ty)
+        return true
+    }
+
     private suspend fun openMissionBoardGoNow(tries: Int = 1): Boolean {
         hud("🎪 buka Carnival")
-        if (!tapTemplate("map_icons/carnival.png", "Carnival", CARNIVAL_RECT, tries)) {
+        if (!openCarnival(tries)) {
             Log.w(TAG, "ikon Carnival tak ketemu"); return false
         }
         delay(D_NAV)
@@ -1199,6 +1480,40 @@ class DailyMissionRunner(
      * dengan "tidak ada misi tersisa", sedangkan menganggap "sudah selesai" secara keliru
      * berarti misi hari itu dilewati diam-diam.
      */
+    // Sisa misi menurut hitungan "(6/10)" di ikon Mission Board. -1 = belum/tidak terbaca.
+    @Volatile private var remainingFromCounter = -1
+
+    /**
+     * Berapa misi yang MASIH perlu dikerjakan, menurut papan itu sendiri.
+     *
+     * Sebelumnya bot selalu disuruh mengejar 10 dan berhenti karena kehabisan misi di
+     * tracker — jalan yang mahal: tiap "misi" yang tidak ada tetap membayar satu penyisiran
+     * tracker penuh sebelum menyerah. Papannya sendiri sudah menyimpan angkanya (keterangan
+     * user), jadi lebih baik ditanya daripada ditebak.
+     *
+     * Kembali ke `fallback` kalau hitungannya tidak terbaca — arah aman: mengerjakan lebih
+     * banyak dari perlu hanya membuang waktu, sedangkan kekurangan berarti misi hari itu
+     * tidak selesai.
+     */
+    fun missionsRemaining(fallback: Int = 10): Int =
+        if (remainingFromCounter in 1..fallback) remainingFromCounter else fallback
+
+    /**
+     * Baca "(6/10)" jadi sisa misi. -1 kalau tidak masuk akal.
+     *
+     * Sanity check-nya bukan formalitas: OCR pada teks sekecil ini gampang menyisipkan atau
+     * menghilangkan digit ("6/10" -> "6110"), dan angka sisa yang salah langsung menentukan
+     * berapa misi yang dikerjakan hari itu.
+     */
+    private fun parseRemaining(counter: String?): Int {
+        if (counter == null) return -1
+        val m = Regex("""(\d{1,2})\s*/\s*(\d{1,2})""").find(counter) ?: return -1
+        val done = m.groupValues[1].toIntOrNull() ?: return -1
+        val total = m.groupValues[2].toIntOrNull() ?: return -1
+        if (total !in 1..20 || done !in 0..total) return -1
+        return total - done
+    }
+
     private data class BoardStatus(
         val panelOpen: Boolean,     // panel Carnival benar-benar terbuka
         val checkmark: Boolean,     // centang hijau terlihat
@@ -1267,7 +1582,7 @@ class DailyMissionRunner(
      */
     suspend fun dailyMissionsDone(): Boolean {
         hud("🎪 cek status daily")
-        if (!tapTemplate("map_icons/carnival.png", "Carnival", CARNIVAL_RECT, 3)) {
+        if (!openCarnival(3)) {
             Log.w(TAG, "cek status: ikon Carnival tak ketemu -> anggap BELUM selesai")
             return false
         }
@@ -1293,7 +1608,14 @@ class DailyMissionRunner(
         // panelOpen tetap WAJIB. Itulah yang memperbaiki kegagalan nyata sebelumnya: tanpa
         // bukti panel terbuka, centang hijau dicari di dunia 3D yang hidup, dan rumput
         // hijau lolos ambang.
-        val done = st.panelOpen && st.checkmark
+        remainingFromCounter = parseRemaining(st.counter)
+        if (remainingFromCounter >= 0)
+            Log.d(TAG, "hitungan papan '${st.counter}' -> sisa ${remainingFromCounter} misi")
+
+        // Hitungan "(10/10)" adalah bukti positif kedua, setara centang: keduanya sama-sama
+        // menyatakan papan sudah habis, hanya lewat tanda yang berbeda. Menerimanya di sini
+        // menutup kasus di mana centangnya gagal dibaca padahal angkanya jelas.
+        val done = st.panelOpen && (st.checkmark || remainingFromCounter == 0)
         Log.d(TAG, "cek status daily: panel=${st.panelOpen} centang=${st.checkmark} " +
             "hitungan='${st.counter ?: "-"}' -> ${if (done) "SUDAH selesai" else "BELUM selesai"}")
         if (!st.panelOpen) Log.w(TAG, "panel Carnival tidak terbukti terbuka -> verdict TIDAK dipercaya")
@@ -1328,8 +1650,11 @@ class DailyMissionRunner(
             return true
         }
         val done = runMissionLoop(maxMissions)
-        Log.d(TAG, "=== DAILY MISSION selesai: $done misi ===")
-        hud("daily mission selesai: $done misi")
+        // Sebut "$done dari $maxMissions": pesan lama ("selesai: 1 misi") terbaca seperti
+        // KEBERHASILAN padahal bisa jadi hasil pembatalan di misi kedua — user membacanya
+        // persis begitu dan mengira misinya salah dianggap tuntas.
+        Log.d(TAG, "=== DAILY MISSION berakhir: $done dari $maxMissions misi ===")
+        hud("daily mission: $done/$maxMissions misi")
         return done > 0
     }
 }
